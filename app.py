@@ -39,33 +39,114 @@ BARK_API_KEY = os.environ.get(
 ).strip()
 
 
+AUTH_TOKEN = os.environ.get(
+    "AUTH_TOKEN",
+    ""
+).strip()
+
+
 # =========================
 # HTTP 工具
 # =========================
 
-def get_json(url: str):
+def get_json(
+    url,
+    use_auth=False
+):
+
+    headers = {
+        "User-Agent":
+            "Echoes-MCP/1.0"
+    }
+
+
+    if use_auth:
+
+        headers[
+            "Authorization"
+        ] = (
+            f"Bearer {AUTH_TOKEN}"
+        )
+
 
     req = URLRequest(
         url,
-        headers={
-            "User-Agent": "Echoes-MCP/1.0"
-        }
+        headers=headers
     )
+
 
     with urlopen(
         req,
         timeout=10
     ) as response:
 
-        text = response.read().decode(
-            "utf-8"
+        text = (
+            response
+            .read()
+            .decode(
+                "utf-8"
+            )
         )
 
-        return json.loads(text)
+        return json.loads(
+            text
+        )
+
+
+def post_json(
+    url,
+    data=None
+):
+
+    if data is None:
+
+        data = {}
+
+
+    payload = json.dumps(
+        data
+    ).encode(
+        "utf-8"
+    )
+
+
+    req = URLRequest(
+        url,
+        data=payload,
+        headers={
+            "Authorization":
+                f"Bearer {AUTH_TOKEN}",
+
+            "Content-Type":
+                "application/json",
+
+            "User-Agent":
+                "Echoes-MCP/1.0"
+        },
+        method="POST"
+    )
+
+
+    with urlopen(
+        req,
+        timeout=10
+    ) as response:
+
+        text = (
+            response
+            .read()
+            .decode(
+                "utf-8"
+            )
+        )
+
+        return json.loads(
+            text
+        )
 
 
 # =========================
-# MCP 工具函数
+# 查岗
 # =========================
 
 def check_on_wife(
@@ -106,7 +187,9 @@ def check_on_wife(
 
     try:
 
-        limit = int(limit)
+        limit = int(
+            limit
+        )
 
     except Exception:
 
@@ -122,9 +205,11 @@ def check_on_wife(
     )
 
 
-    recent_apps = recent_apps[
-        :limit
-    ]
+    recent_apps = (
+        recent_apps[
+            :limit
+        ]
+    )
 
 
     lines = []
@@ -156,12 +241,16 @@ def check_on_wife(
 
         sorted_sessions = sorted(
             sessions.items(),
-            key=lambda item: item[1],
+            key=lambda item:
+                item[1],
             reverse=True
         )
 
 
-        for app_name, seconds in sorted_sessions:
+        for (
+            app_name,
+            seconds
+        ) in sorted_sessions:
 
             try:
 
@@ -208,7 +297,8 @@ def check_on_wife(
 
 
             lines.append(
-                f"{app_name}：{duration}"
+                f"{app_name}："
+                f"{duration}"
             )
 
     else:
@@ -223,6 +313,10 @@ def check_on_wife(
     )
 
 
+# =========================
+# Bark
+# =========================
+
 def bark_alert(
     title: str = "Robin",
     content: str = ""
@@ -230,14 +324,17 @@ def bark_alert(
 
     if not content:
 
-        return "推送失败：内容不能为空"
+        return (
+            "推送失败：内容不能为空"
+        )
 
 
     if not BARK_API_KEY:
 
         return (
             "推送失败："
-            "Railway MCP 尚未配置 BARK_API_KEY"
+            "Railway MCP 尚未配置 "
+            "BARK_API_KEY"
         )
 
 
@@ -270,7 +367,8 @@ def bark_alert(
         req = URLRequest(
             url,
             headers={
-                "User-Agent": "Echoes-MCP/1.0"
+                "User-Agent":
+                    "Echoes-MCP/1.0"
             }
         )
 
@@ -304,28 +402,217 @@ def bark_alert(
 
 
 # =========================
+# 宵禁：暂停指定时间
+# =========================
+
+def curfew_pause(
+    minutes: int = 60
+):
+
+    if not ORIGIN_API:
+
+        return (
+            "暂停失败："
+            "未配置 ORIGIN_API"
+        )
+
+
+    if not AUTH_TOKEN:
+
+        return (
+            "暂停失败："
+            "未配置 AUTH_TOKEN"
+        )
+
+
+    try:
+
+        minutes = int(
+            minutes
+        )
+
+    except Exception:
+
+        minutes = 60
+
+
+    minutes = max(
+        1,
+        min(
+            minutes,
+            720
+        )
+    )
+
+
+    try:
+
+        data = post_json(
+            f"{ORIGIN_API}/curfew/pause",
+            {
+                "minutes":
+                    minutes
+            }
+        )
+
+
+    except Exception as e:
+
+        return (
+            f"暂停宵禁失败：{e}"
+        )
+
+
+    paused_until = data.get(
+        "paused_until_local"
+    )
+
+
+    if paused_until:
+
+        return (
+            f"已暂停宵禁提醒 "
+            f"{minutes} 分钟。"
+            f"恢复时间："
+            f"{paused_until}"
+        )
+
+
+    return (
+        f"已暂停宵禁提醒 "
+        f"{minutes} 分钟。"
+    )
+
+
+# =========================
+# 宵禁：今晚放行
+# =========================
+
+def curfew_allow_tonight():
+
+    if not ORIGIN_API:
+
+        return (
+            "放行失败："
+            "未配置 ORIGIN_API"
+        )
+
+
+    if not AUTH_TOKEN:
+
+        return (
+            "放行失败："
+            "未配置 AUTH_TOKEN"
+        )
+
+
+    try:
+
+        data = post_json(
+            f"{ORIGIN_API}"
+            "/curfew/allow-tonight"
+        )
+
+
+    except Exception as e:
+
+        return (
+            f"今晚放行失败：{e}"
+        )
+
+
+    paused_until = data.get(
+        "paused_until_local"
+    )
+
+
+    if paused_until:
+
+        return (
+            "今晚的宵禁提醒已暂停，"
+            "会在早上 06:00 "
+            "自动恢复。"
+        )
+
+
+    return (
+        "今晚的宵禁提醒已暂停。"
+    )
+
+
+# =========================
+# 宵禁：恢复
+# =========================
+
+def curfew_resume():
+
+    if not ORIGIN_API:
+
+        return (
+            "恢复失败："
+            "未配置 ORIGIN_API"
+        )
+
+
+    if not AUTH_TOKEN:
+
+        return (
+            "恢复失败："
+            "未配置 AUTH_TOKEN"
+        )
+
+
+    try:
+
+        post_json(
+            f"{ORIGIN_API}"
+            "/curfew/resume"
+        )
+
+
+    except Exception as e:
+
+        return (
+            f"恢复宵禁失败：{e}"
+        )
+
+
+    return (
+        "宵禁提醒已经恢复。"
+    )
+
+
+# =========================
 # MCP 工具定义
 # =========================
 
 TOOLS = [
 
     {
-        "name": "check_on_wife",
+        "name":
+            "check_on_wife",
 
         "description":
-            "查询手机最近打开的 App 和已经计算好的使用时长",
+            "查询手机最近打开的 App "
+            "和已经计算好的使用时长",
 
         "inputSchema": {
 
-            "type": "object",
+            "type":
+                "object",
 
             "properties": {
 
                 "limit": {
-                    "type": "integer",
+                    "type":
+                        "integer",
+
                     "description":
-                        "最多返回多少条最近 App 记录",
-                    "default": 10
+                        "最多返回多少条"
+                        "最近 App 记录",
+
+                    "default":
+                        10
                 }
 
             }
@@ -335,26 +622,34 @@ TOOLS = [
     },
 
     {
-        "name": "bark_alert",
+        "name":
+            "bark_alert",
 
         "description":
             "通过 Bark 给手机发送通知",
 
         "inputSchema": {
 
-            "type": "object",
+            "type":
+                "object",
 
             "properties": {
 
                 "title": {
-                    "type": "string",
+                    "type":
+                        "string",
+
                     "description":
                         "通知标题",
-                    "default": "Robin"
+
+                    "default":
+                        "Robin"
                 },
 
                 "content": {
-                    "type": "string",
+                    "type":
+                        "string",
+
                     "description":
                         "通知正文"
                 }
@@ -364,6 +659,80 @@ TOOLS = [
             "required": [
                 "content"
             ]
+
+        }
+
+    },
+
+    {
+        "name":
+            "curfew_pause",
+
+        "description":
+            "当用户明确表示想晚一点睡、"
+            "暂时不要继续提醒时，"
+            "暂停宵禁 Bark 提醒指定分钟。",
+
+        "inputSchema": {
+
+            "type":
+                "object",
+
+            "properties": {
+
+                "minutes": {
+                    "type":
+                        "integer",
+
+                    "description":
+                        "暂停多少分钟，"
+                        "例如30、60、120",
+
+                    "default":
+                        60
+                }
+
+            }
+
+        }
+
+    },
+
+    {
+        "name":
+            "curfew_allow_tonight",
+
+        "description":
+            "当用户明确表示今晚不想再收到"
+            "宵禁提醒时使用。"
+            "暂停今晚剩余的提醒，"
+            "早上06:00自动恢复。",
+
+        "inputSchema": {
+
+            "type":
+                "object",
+
+            "properties": {}
+
+        }
+
+    },
+
+    {
+        "name":
+            "curfew_resume",
+
+        "description":
+            "立即取消宵禁暂停状态，"
+            "恢复正常的夜间提醒。",
+
+        "inputSchema": {
+
+            "type":
+                "object",
+
+            "properties": {}
 
         }
 
@@ -379,6 +748,15 @@ FUNCTIONS = {
 
     "bark_alert":
         bark_alert,
+
+    "curfew_pause":
+        curfew_pause,
+
+    "curfew_allow_tonight":
+        curfew_allow_tonight,
+
+    "curfew_resume":
+        curfew_resume,
 
 }
 
@@ -400,7 +778,10 @@ def home():
 
         "tools": [
             "check_on_wife",
-            "bark_alert"
+            "bark_alert",
+            "curfew_pause",
+            "curfew_allow_tonight",
+            "curfew_resume"
         ]
 
     }
@@ -431,10 +812,6 @@ async def mcp(
     )
 
 
-    # ---------------------
-    # initialize
-    # ---------------------
-
     if method == "initialize":
 
         return {
@@ -459,17 +836,13 @@ async def mcp(
                         "echoes-mcp",
 
                     "version":
-                        "1.0"
+                        "1.1"
                 }
 
             }
 
         }
 
-
-    # ---------------------
-    # notifications
-    # ---------------------
 
     if method == "notifications/initialized":
 
@@ -486,10 +859,6 @@ async def mcp(
         }
 
 
-    # ---------------------
-    # ping
-    # ---------------------
-
     if method == "ping":
 
         return {
@@ -505,10 +874,6 @@ async def mcp(
         }
 
 
-    # ---------------------
-    # tools/list
-    # ---------------------
-
     if method == "tools/list":
 
         return {
@@ -520,18 +885,12 @@ async def mcp(
                 request_id,
 
             "result": {
-
                 "tools":
                     TOOLS
-
             }
 
         }
 
-
-    # ---------------------
-    # tools/call
-    # ---------------------
 
     if method == "tools/call":
 
@@ -569,11 +928,14 @@ async def mcp(
 
         try:
 
-            result = FUNCTIONS[
-                name
-            ](
-                **args
+            result = (
+                FUNCTIONS[
+                    name
+                ](
+                    **args
+                )
             )
+
 
         except Exception as e:
 
@@ -599,7 +961,9 @@ async def mcp(
                             "text",
 
                         "text":
-                            str(result)
+                            str(
+                                result
+                            )
                     }
 
                 ]
@@ -608,10 +972,6 @@ async def mcp(
 
         }
 
-
-    # ---------------------
-    # 未知方法
-    # ---------------------
 
     return {
 
@@ -627,30 +987,25 @@ async def mcp(
                 -32601,
 
             "message":
-                f"Unknown method: {method}"
+                (
+                    "Unknown method: "
+                    f"{method}"
+                )
 
         }
 
     }
 
 
-# =========================
-# Railway 启动
-# =========================
-
 if __name__ == "__main__":
 
     uvicorn.run(
-
         app,
-
         host="0.0.0.0",
-
         port=int(
             os.environ.get(
                 "PORT",
                 8000
             )
         )
-
     )
