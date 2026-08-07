@@ -104,7 +104,8 @@ def post_json(
 
 
     payload = json.dumps(
-        data
+        data,
+        ensure_ascii=False
     ).encode(
         "utf-8"
     )
@@ -455,7 +456,6 @@ def curfew_pause(
             }
         )
 
-
     except Exception as e:
 
         return (
@@ -513,7 +513,6 @@ def curfew_allow_tonight():
             "/curfew/allow-tonight"
         )
 
-
     except Exception as e:
 
         return (
@@ -569,7 +568,6 @@ def curfew_resume():
             "/curfew/resume"
         )
 
-
     except Exception as e:
 
         return (
@@ -579,6 +577,125 @@ def curfew_resume():
 
     return (
         "宵禁提醒已经恢复。"
+    )
+
+
+# =========================
+# 获取未读提醒
+# =========================
+
+def get_pending_reminders():
+
+    if not ORIGIN_API:
+
+        return (
+            "读取提醒失败："
+            "未配置 ORIGIN_API"
+        )
+
+
+    if not AUTH_TOKEN:
+
+        return (
+            "读取提醒失败："
+            "未配置 AUTH_TOKEN"
+        )
+
+
+    try:
+
+        data = post_json(
+            f"{ORIGIN_API}"
+            "/reminders/consume"
+        )
+
+    except Exception as e:
+
+        return (
+            f"读取未读提醒失败：{e}"
+        )
+
+
+    reminders = data.get(
+        "reminders",
+        []
+    )
+
+
+    if not reminders:
+
+        return (
+            "目前没有未读的系统提醒。"
+        )
+
+
+    lines = [
+        f"共有 {len(reminders)} 条未读提醒："
+    ]
+
+
+    for reminder in reminders:
+
+        title = (
+            reminder.get(
+                "title"
+            )
+            or
+            "系统提醒"
+        )
+
+        content = (
+            reminder.get(
+                "content"
+            )
+            or
+            ""
+        )
+
+        created_at = (
+            reminder.get(
+                "created_at_local"
+            )
+            or
+            ""
+        )
+
+
+        time_text = created_at
+
+
+        if "T" in created_at:
+
+            try:
+
+                time_part = (
+                    created_at
+                    .split(
+                        "T",
+                        1
+                    )[1]
+                )
+
+                time_text = (
+                    time_part[
+                        :5
+                    ]
+                )
+
+            except Exception:
+
+                pass
+
+
+        lines.append(
+            f"[{time_text}] "
+            f"{title}："
+            f"{content}"
+        )
+
+
+    return "\n".join(
+        lines
     )
 
 
@@ -736,6 +853,31 @@ TOOLS = [
 
         }
 
+    },
+
+    {
+        "name":
+            "get_pending_reminders",
+
+        "description":
+            "读取 Railway 后台尚未在聊天中"
+            "处理过的系统提醒。"
+            "当用户发送新的聊天消息时，"
+            "尤其在夜间，优先调用此工具检查"
+            "是否有 Robin 之前通过 Bark "
+            "发送过但用户尚未在聊天中看到的提醒。"
+            "读取后这些提醒会被标记为已读，"
+            "避免重复显示。",
+
+        "inputSchema": {
+
+            "type":
+                "object",
+
+            "properties": {}
+
+        }
+
     }
 
 ]
@@ -757,6 +899,9 @@ FUNCTIONS = {
 
     "curfew_resume":
         curfew_resume,
+
+    "get_pending_reminders":
+        get_pending_reminders,
 
 }
 
@@ -781,7 +926,8 @@ def home():
             "bark_alert",
             "curfew_pause",
             "curfew_allow_tonight",
-            "curfew_resume"
+            "curfew_resume",
+            "get_pending_reminders"
         ]
 
     }
@@ -836,7 +982,7 @@ async def mcp(
                         "echoes-mcp",
 
                     "version":
-                        "1.1"
+                        "1.2"
                 }
 
             }
@@ -935,7 +1081,6 @@ async def mcp(
                     **args
                 )
             )
-
 
         except Exception as e:
 
