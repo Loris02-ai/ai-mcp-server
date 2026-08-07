@@ -147,6 +147,128 @@ def post_json(
 
 
 # =========================
+# 未读提醒内部工具
+# =========================
+
+def consume_pending_reminders():
+
+    if not ORIGIN_API:
+
+        return []
+
+
+    if not AUTH_TOKEN:
+
+        return []
+
+
+    try:
+
+        data = post_json(
+            f"{ORIGIN_API}"
+            "/reminders/consume"
+        )
+
+    except Exception:
+
+        return []
+
+
+    reminders = data.get(
+        "reminders",
+        []
+    )
+
+
+    if not isinstance(
+        reminders,
+        list
+    ):
+
+        return []
+
+
+    return reminders
+
+
+def format_reminders(
+    reminders
+):
+
+    if not reminders:
+
+        return ""
+
+
+    lines = []
+
+
+    for reminder in reminders:
+
+        title = (
+            reminder.get(
+                "title"
+            )
+            or
+            "系统提醒"
+        )
+
+        content = (
+            reminder.get(
+                "content"
+            )
+            or
+            ""
+        )
+
+        created_at = (
+            reminder.get(
+                "created_at_local"
+            )
+            or
+            ""
+        )
+
+
+        time_text = created_at
+
+
+        if "T" in created_at:
+
+            try:
+
+                time_part = (
+                    created_at
+                    .split(
+                        "T",
+                        1
+                    )[1]
+                )
+
+                time_text = (
+                    time_part[
+                        :5
+                    ]
+                )
+
+            except Exception:
+
+                pass
+
+
+        lines.append(
+            f"[{time_text}] "
+            f"{title}："
+            f"{content}"
+        )
+
+
+    return "\n".join(
+        lines
+    )
+
+
+# =========================
 # 查岗
 # =========================
 
@@ -404,6 +526,7 @@ def bark_alert(
 
 # =========================
 # 宵禁：暂停指定时间
+# 同时读取刚刚的未读提醒
 # =========================
 
 def curfew_pause(
@@ -446,6 +569,7 @@ def curfew_pause(
     )
 
 
+    # 先执行暂停
     try:
 
         data = post_json(
@@ -468,24 +592,61 @@ def curfew_pause(
     )
 
 
+    # 暂停成功后，
+    # 自动读取刚刚的系统提醒
+    reminders = (
+        consume_pending_reminders()
+    )
+
+    reminder_text = (
+        format_reminders(
+            reminders
+        )
+    )
+
+
+    lines = []
+
+
+    if reminder_text:
+
+        lines.append(
+            "刚刚有未读的宵禁提醒："
+        )
+
+        lines.append(
+            reminder_text
+        )
+
+
     if paused_until:
 
-        return (
+        lines.append(
             f"已暂停宵禁提醒 "
             f"{minutes} 分钟。"
+        )
+
+        lines.append(
             f"恢复时间："
             f"{paused_until}"
         )
 
+    else:
 
-    return (
-        f"已暂停宵禁提醒 "
-        f"{minutes} 分钟。"
+        lines.append(
+            f"已暂停宵禁提醒 "
+            f"{minutes} 分钟。"
+        )
+
+
+    return "\n".join(
+        lines
     )
 
 
 # =========================
 # 宵禁：今晚放行
+# 同时读取刚刚的未读提醒
 # =========================
 
 def curfew_allow_tonight():
@@ -506,6 +667,7 @@ def curfew_allow_tonight():
         )
 
 
+    # 先执行今晚放行
     try:
 
         data = post_json(
@@ -525,17 +687,50 @@ def curfew_allow_tonight():
     )
 
 
+    # 放行成功以后，
+    # 自动读取刚刚的系统提醒
+    reminders = (
+        consume_pending_reminders()
+    )
+
+    reminder_text = (
+        format_reminders(
+            reminders
+        )
+    )
+
+
+    lines = []
+
+
+    if reminder_text:
+
+        lines.append(
+            "刚刚有未读的宵禁提醒："
+        )
+
+        lines.append(
+            reminder_text
+        )
+
+
     if paused_until:
 
-        return (
+        lines.append(
             "今晚的宵禁提醒已暂停，"
             "会在早上 06:00 "
             "自动恢复。"
         )
 
+    else:
 
-    return (
-        "今晚的宵禁提醒已暂停。"
+        lines.append(
+            "今晚的宵禁提醒已暂停。"
+        )
+
+
+    return "\n".join(
+        lines
     )
 
 
@@ -581,7 +776,7 @@ def curfew_resume():
 
 
 # =========================
-# 获取未读提醒
+# 手动获取未读提醒
 # =========================
 
 def get_pending_reminders():
@@ -602,23 +797,8 @@ def get_pending_reminders():
         )
 
 
-    try:
-
-        data = post_json(
-            f"{ORIGIN_API}"
-            "/reminders/consume"
-        )
-
-    except Exception as e:
-
-        return (
-            f"读取未读提醒失败：{e}"
-        )
-
-
-    reminders = data.get(
-        "reminders",
-        []
+    reminders = (
+        consume_pending_reminders()
     )
 
 
@@ -629,73 +809,17 @@ def get_pending_reminders():
         )
 
 
-    lines = [
-        f"共有 {len(reminders)} 条未读提醒："
-    ]
-
-
-    for reminder in reminders:
-
-        title = (
-            reminder.get(
-                "title"
-            )
-            or
-            "系统提醒"
+    reminder_text = (
+        format_reminders(
+            reminders
         )
-
-        content = (
-            reminder.get(
-                "content"
-            )
-            or
-            ""
-        )
-
-        created_at = (
-            reminder.get(
-                "created_at_local"
-            )
-            or
-            ""
-        )
+    )
 
 
-        time_text = created_at
-
-
-        if "T" in created_at:
-
-            try:
-
-                time_part = (
-                    created_at
-                    .split(
-                        "T",
-                        1
-                    )[1]
-                )
-
-                time_text = (
-                    time_part[
-                        :5
-                    ]
-                )
-
-            except Exception:
-
-                pass
-
-
-        lines.append(
-            f"[{time_text}] "
-            f"{title}："
-            f"{content}"
-        )
-
-
-    return "\n".join(
-        lines
+    return (
+        f"共有 {len(reminders)} "
+        "条未读提醒：\n"
+        f"{reminder_text}"
     )
 
 
@@ -786,9 +910,13 @@ TOOLS = [
             "curfew_pause",
 
         "description":
-            "当用户明确表示想晚一点睡、"
-            "暂时不要继续提醒时，"
-            "暂停宵禁 Bark 提醒指定分钟。",
+            "当用户在收到宵禁提醒后表示"
+            "还想再玩一会儿、晚一点睡，"
+            "自动读取刚才尚未处理的系统提醒，"
+            "让 Robin 知道刚才提醒了什么，"
+            "然后暂停宵禁 Bark 提醒指定分钟。"
+            "例如用户说再玩10分钟时，"
+            "应使用 minutes=10。",
 
         "inputSchema": {
 
@@ -803,7 +931,10 @@ TOOLS = [
 
                     "description":
                         "暂停多少分钟，"
-                        "例如30、60、120",
+                        "根据用户明确说的时间填写。"
+                        "例如再玩10分钟就填10，"
+                        "半小时就填30，"
+                        "一小时就填60。",
 
                     "default":
                         60
@@ -820,9 +951,12 @@ TOOLS = [
             "curfew_allow_tonight",
 
         "description":
-            "当用户明确表示今晚不想再收到"
-            "宵禁提醒时使用。"
-            "暂停今晚剩余的提醒，"
+            "当用户在收到宵禁提醒后明确表示"
+            "今晚要熬夜、今晚不想睡、"
+            "今晚不要再提醒时使用。"
+            "工具会自动读取刚才尚未处理的"
+            "系统提醒，让 Robin 知道提醒内容，"
+            "然后暂停今晚剩余的 Bark 宵禁提醒，"
             "早上06:00自动恢复。",
 
         "inputSchema": {
@@ -842,7 +976,9 @@ TOOLS = [
 
         "description":
             "立即取消宵禁暂停状态，"
-            "恢复正常的夜间提醒。",
+            "恢复正常的夜间提醒。"
+            "例如用户之前说今晚不提醒，"
+            "后来又要求恢复提醒时使用。",
 
         "inputSchema": {
 
@@ -860,14 +996,15 @@ TOOLS = [
             "get_pending_reminders",
 
         "description":
-            "读取 Railway 后台尚未在聊天中"
+            "手动读取 Railway 后台尚未在聊天中"
             "处理过的系统提醒。"
-            "当用户发送新的聊天消息时，"
-            "尤其在夜间，优先调用此工具检查"
-            "是否有 Robin 之前通过 Bark "
-            "发送过但用户尚未在聊天中看到的提醒。"
-            "读取后这些提醒会被标记为已读，"
-            "避免重复显示。",
+            "如果用户只是询问有没有未读提醒，"
+            "可以调用此工具。"
+            "curfew_pause 和 "
+            "curfew_allow_tonight "
+            "已经会自动读取未读宵禁提醒，"
+            "无需额外再调用一次。"
+            "读取后提醒会标记为已读。",
 
         "inputSchema": {
 
@@ -982,7 +1119,7 @@ async def mcp(
                         "echoes-mcp",
 
                     "version":
-                        "1.2"
+                        "1.3"
                 }
 
             }
