@@ -1,5 +1,13 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+
+import contextlib
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from mcp.server import MCPServer
+from mcp.server.transport_security import TransportSecuritySettings
 
 import json
 import os
@@ -10,8 +18,42 @@ from urllib.request import Request as URLRequest
 from urllib.request import urlopen
 
 
+# =========================
+# 标准 Health MCP（官方 MCP Python SDK v2）
+# =========================
+#
+# 为了不破坏你现在已经能用的 /mcp（查岗、Bark、宵禁等），
+# 健康 MCP 先独立挂载在：
+#
+#   /health/mcp
+#
+# 等 Kelivo / Echoes 都验证成功后，再决定是否把所有工具合并到同一个标准 MCP。
+#
+
+health_mcp = MCPServer(
+    "Echoes Health MCP"
+)
+
+health_mcp_http_app = health_mcp.streamable_http_app(
+    transport_security=TransportSecuritySettings(
+        # Railway 前面有反向代理。
+        # 第一阶段先关闭 SDK 的 DNS rebinding Host 限制，
+        # 否则公网 Railway 域名会收到 421。
+        enable_dns_rebinding_protection=False
+    )
+)
+
+
+@contextlib.asynccontextmanager
+async def lifespan(app: FastAPI):
+
+    async with health_mcp.session_manager.run():
+        yield
+
+
 app = FastAPI(
-    title="Echoes MCP Server"
+    title="Echoes MCP Server",
+    lifespan=lifespan
 )
 
 
@@ -20,6 +62,7 @@ app.add_middleware(
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Mcp-Session-Id"],
 )
 
 
@@ -823,6 +866,498 @@ def get_pending_reminders():
     )
 
 
+
+# =========================
+# 健康数据：第一阶段临时存储
+# =========================
+#
+# 这一版的目的：
+# 1. 先验证 Kelivo / Echoes 能否正确连接“标准 Streamable HTTP MCP”
+# 2. 再接 iPhone / Apple Health 自动上传
+#
+# Railway 的普通文件系统可能在重新部署/重启后丢失，
+# 因此这里暂时只用于第一阶段测试。
+# 后面确认链路正常后，再换成持久化存储。
+#
+
+HEALTH_DATA_FILE = Path(
+    os.environ.get(
+        "HEALTH_DATA_FILE",
+        "/tmp/echoes_health_data.json"
+    )
+)
+
+
+def empty_health_data():
+
+    return {
+        "status": "no_data",
+        "received_at": None,
+        "source": None,
+
+        "heart_rate": {
+            "latest_bpm": None,
+            "resting_bpm": None,
+            "min_bpm": None,
+            "max_bpm": None,
+            "recorded_at": None
+        },
+
+        "oxygen": {
+            "latest_percent": None,
+            "min_percent": None,
+            "max_percent": None,
+            "recorded_at": None
+        },
+
+        "steps": {
+            "count": None,
+            "date": None
+        },
+
+        "sleep": {
+            "status": "no_data",
+            "date": None,
+            "total_minutes": None,
+            "deep_minutes": None,
+            "light_minutes": None,
+            "rem_minutes": None,
+            "awake_minutes": None,
+            "sleep_start": None,
+            "sleep_end": None
+        }
+    }
+
+
+def read_health_data():
+
+    if not HEALTH_DATA_FILE.exists():
+
+        return empty_health_data()
+
+
+    try:
+
+        with HEALTH_DATA_FILE.open(
+            "r",
+            encoding="utf-8"
+        ) as fp:
+
+            data = json.load(
+                fp
+            )
+
+
+        if not isinstance(
+            data,
+            dict
+        ):
+
+            return empty_health_data()
+
+
+        return data
+
+
+    except Exception:
+
+        return empty_health_data()
+
+
+def save_health_data(
+    data
+):
+
+    HEALTH_DATA_FILE.parent.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+
+    with HEALTH_DATA_FILE.open(
+        "w",
+        encoding="utf-8"
+    ) as fp:
+
+        json.dump(
+            data,
+            fp,
+            ensure_ascii=False,
+            indent=2
+        )
+
+
+def merge_dict(
+    base,
+    incoming
+):
+
+    if not isinstance(
+        incoming,
+        dict
+    ):
+
+        return base
+
+
+    for key, value in incoming.items():
+
+        if (
+            isinstance(
+                value,
+                dict
+            )
+            and
+            isinstance(
+                base.get(key),
+                dict
+            )
+        ):
+
+            base[key] = merge_dict(
+                base[key],
+                value
+            )
+
+        else:
+
+            base[key] = value
+
+
+    return base
+
+
+# =========================
+# 健康数据 HTTP 接口
+# =========================
+
+@app.get("/health/status")
+def health_status():
+
+    data = read_health_data()
+
+    return {
+        "status": "online",
+        "health_mcp": "/health/mcp",
+        "has_health_data":
+            data.get("status") == "ok",
+        "received_at":
+            data.get("received_at")
+    }
+
+
+@app.post("/health/upload")
+async def health_upload(
+    request: Request
+):
+
+    # 上传健康数据必须验证 AUTH_TOKEN。
+    # 以后 Health Auto Export / 快捷指令会把：
+    #
+    #   Authorization: Bearer 你的 AUTH_TOKEN
+    #
+    # 一起发送过来。
+    if not AUTH_TOKEN:
+
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "服务器尚未配置 AUTH_TOKEN，"
+                "已拒绝健康数据上传。"
+            )
+        )
+
+
+    authorization = (
+        request.headers
+        .get(
+            "Authorization",
+            ""
+        )
+        .strip()
+    )
+
+
+    if authorization != f"Bearer {AUTH_TOKEN}":
+
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized"
+        )
+
+
+    payload = await request.json()
+
+
+    if not isinstance(
+        payload,
+        dict
+    ):
+
+        raise HTTPException(
+            status_code=400,
+            detail="JSON body 必须是对象"
+        )
+
+
+    current = read_health_data()
+
+
+    if current.get("status") != "ok":
+
+        current = empty_health_data()
+
+
+    merged = merge_dict(
+        current,
+        payload
+    )
+
+
+    merged["status"] = "ok"
+
+    merged["received_at"] = (
+        datetime.now(
+            timezone.utc
+        )
+        .isoformat()
+    )
+
+
+    if not merged.get("source"):
+
+        merged["source"] = (
+            "apple_health"
+        )
+
+
+    save_health_data(
+        merged
+    )
+
+
+    return {
+        "ok": True,
+        "received_at":
+            merged["received_at"]
+    }
+
+
+# =========================
+# 标准 Health MCP 工具
+# =========================
+
+@health_mcp.tool()
+def get_latest_health() -> dict[str, Any]:
+    """
+    查询最近一次已经同步到服务器的健康数据总览。
+    当用户询问自己最近的心率、静息心率、血氧、步数、睡眠，
+    或希望查看整体健康记录时使用。
+    数据来自穿戴设备/健康 App，仅用于查看记录，不代表医学诊断。
+    """
+
+    return read_health_data()
+
+
+@health_mcp.tool()
+def get_heart_rate() -> dict[str, Any]:
+    """
+    查询最近同步的心率记录，包括最近心率、静息心率、
+    最低心率、最高心率和记录时间。
+    当用户询问心率、脉搏或静息心率时使用。
+    """
+
+    data = read_health_data()
+
+    return {
+        "status":
+            data.get(
+                "status",
+                "no_data"
+            ),
+
+        "received_at":
+            data.get(
+                "received_at"
+            ),
+
+        "heart_rate":
+            data.get(
+                "heart_rate",
+                {}
+            )
+    }
+
+
+@health_mcp.tool()
+def get_steps() -> dict[str, Any]:
+    """
+    查询最近同步的步数记录。
+    当用户询问今天走了多少步、活动量或步数时使用。
+    """
+
+    data = read_health_data()
+
+    return {
+        "status":
+            data.get(
+                "status",
+                "no_data"
+            ),
+
+        "received_at":
+            data.get(
+                "received_at"
+            ),
+
+        "steps":
+            data.get(
+                "steps",
+                {}
+            )
+    }
+
+
+@health_mcp.tool()
+def get_oxygen() -> dict[str, Any]:
+    """
+    查询最近同步的血氧饱和度记录。
+    当用户询问血氧、SpO2 或最近血氧记录时使用。
+    这是穿戴设备记录，不作为医学诊断。
+    """
+
+    data = read_health_data()
+
+    return {
+        "status":
+            data.get(
+                "status",
+                "no_data"
+            ),
+
+        "received_at":
+            data.get(
+                "received_at"
+            ),
+
+        "oxygen":
+            data.get(
+                "oxygen",
+                {}
+            )
+    }
+
+
+@health_mcp.tool()
+def get_sleep() -> dict[str, Any]:
+    """
+    查询最近同步的睡眠记录，包括总睡眠时长和可用的睡眠阶段。
+    当用户询问昨晚睡了多久、睡眠记录或睡眠阶段时使用。
+    如果手环没有佩戴、没有同步或当前没有近期睡眠数据，
+    会返回 no_data；不能把 no_data 解释为用户没有睡觉。
+    """
+
+    data = read_health_data()
+
+    sleep = data.get(
+        "sleep",
+        {}
+    )
+
+
+    if not isinstance(
+        sleep,
+        dict
+    ):
+
+        sleep = {
+            "status":
+                "no_data"
+        }
+
+
+    return {
+        "status":
+            data.get(
+                "status",
+                "no_data"
+            ),
+
+        "received_at":
+            data.get(
+                "received_at"
+            ),
+
+        "sleep":
+            sleep,
+
+        "important_note": (
+            "如果 sleep.status 为 no_data，"
+            "只表示没有可用的手环/同步记录，"
+            "不能据此判断用户没有睡觉。"
+        )
+    }
+
+
+@health_mcp.tool()
+def get_health_summary() -> dict[str, Any]:
+    """
+    获取适合 AI 总结的最近健康数据摘要。
+    当用户询问“看看我今天/最近的身体数据”“帮我总结健康记录”
+    或同时涉及心率、血氧、步数、睡眠中的多项数据时使用。
+    """
+
+    data = read_health_data()
+
+    return {
+        "status":
+            data.get(
+                "status",
+                "no_data"
+            ),
+
+        "received_at":
+            data.get(
+                "received_at"
+            ),
+
+        "source":
+            data.get(
+                "source"
+            ),
+
+        "heart_rate":
+            data.get(
+                "heart_rate",
+                {}
+            ),
+
+        "oxygen":
+            data.get(
+                "oxygen",
+                {}
+            ),
+
+        "steps":
+            data.get(
+                "steps",
+                {}
+            ),
+
+        "sleep":
+            data.get(
+                "sleep",
+                {}
+            ),
+
+        "note": (
+            "这些是穿戴设备/健康 App 的记录，"
+            "只用于查看和整理，不代表医学诊断。"
+        )
+    }
+
+
+
 # =========================
 # MCP 工具定义
 # =========================
@@ -1058,6 +1593,9 @@ def home():
         "server":
             "echoes-mcp",
 
+        "health_mcp":
+            "/health/mcp",
+
         "tools": [
             "check_on_wife",
             "bark_alert",
@@ -1277,6 +1815,23 @@ async def mcp(
         }
 
     }
+
+
+# =========================
+# 挂载标准 Health MCP
+# =========================
+#
+# 对外地址：
+#   https://你的-Railway-域名/health/mcp
+#
+# 注意：必须放在现有 FastAPI 路由定义之后，
+# 这样不会影响原来的 /mcp、/health/upload 等接口。
+#
+
+app.mount(
+    "/health",
+    health_mcp_http_app
+)
 
 
 if __name__ == "__main__":
