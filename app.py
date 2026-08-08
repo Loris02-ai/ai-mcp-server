@@ -1027,6 +1027,708 @@ def merge_dict(
     return base
 
 
+
+# =========================
+# Health Auto Export JSON V2 解析
+# =========================
+
+def to_float(
+    value
+):
+
+    try:
+
+        if value is None:
+
+            return None
+
+
+        return float(
+            value
+        )
+
+    except Exception:
+
+        return None
+
+
+def round_number(
+    value,
+    digits=1
+):
+
+    number = to_float(
+        value
+    )
+
+
+    if number is None:
+
+        return None
+
+
+    rounded = round(
+        number,
+        digits
+    )
+
+
+    if float(
+        rounded
+    ).is_integer():
+
+        return int(
+            rounded
+        )
+
+
+    return rounded
+
+
+def latest_metric_item(
+    items
+):
+
+    if not isinstance(
+        items,
+        list
+    ):
+
+        return None
+
+
+    valid = [
+        item
+        for item in items
+        if isinstance(
+            item,
+            dict
+        )
+    ]
+
+
+    if not valid:
+
+        return None
+
+
+    # Health Auto Export 的日期字符串本身按
+    # yyyy-MM-dd HH:mm:ss Z 排序即可满足这里的“最近一条”用途。
+    return max(
+        valid,
+        key=lambda item:
+            str(
+                item.get(
+                    "date",
+                    ""
+                )
+            )
+    )
+
+
+def normalize_percent(
+    value
+):
+
+    number = to_float(
+        value
+    )
+
+
+    if number is None:
+
+        return None
+
+
+    # 某些来源可能用 0~1 表示百分比。
+    if 0 <= number <= 1:
+
+        number = (
+            number
+            * 100
+        )
+
+
+    return round_number(
+        number,
+        1
+    )
+
+
+def hours_to_minutes(
+    value
+):
+
+    hours = to_float(
+        value
+    )
+
+
+    if hours is None:
+
+        return None
+
+
+    return int(
+        round(
+            hours
+            * 60
+        )
+    )
+
+
+def metric_map_from_payload(
+    payload
+):
+
+    data = payload.get(
+        "data",
+        {}
+    )
+
+
+    if not isinstance(
+        data,
+        dict
+    ):
+
+        return {}
+
+
+    metrics = data.get(
+        "metrics",
+        []
+    )
+
+
+    if not isinstance(
+        metrics,
+        list
+    ):
+
+        return {}
+
+
+    result = {}
+
+
+    for metric in metrics:
+
+        if not isinstance(
+            metric,
+            dict
+        ):
+
+            continue
+
+
+        name = str(
+            metric.get(
+                "name",
+                ""
+            )
+        ).strip()
+
+
+        if not name:
+
+            continue
+
+
+        result[
+            name
+        ] = metric
+
+
+    return result
+
+
+def parse_health_auto_export(
+    payload
+):
+
+    metrics = metric_map_from_payload(
+        payload
+    )
+
+
+    if not metrics:
+
+        return None
+
+
+    parsed = {
+        "source":
+            "health_auto_export"
+    }
+
+
+    # -------------------------
+    # 心率
+    # -------------------------
+
+    heart_metric = metrics.get(
+        "heart_rate"
+    )
+
+
+    if isinstance(
+        heart_metric,
+        dict
+    ):
+
+        heart_items = heart_metric.get(
+            "data",
+            []
+        )
+
+
+        latest = latest_metric_item(
+            heart_items
+        )
+
+
+        min_values = []
+        max_values = []
+
+
+        if isinstance(
+            heart_items,
+            list
+        ):
+
+            for item in heart_items:
+
+                if not isinstance(
+                    item,
+                    dict
+                ):
+
+                    continue
+
+
+                min_value = to_float(
+                    item.get(
+                        "Min",
+                        item.get(
+                            "min"
+                        )
+                    )
+                )
+
+                max_value = to_float(
+                    item.get(
+                        "Max",
+                        item.get(
+                            "max"
+                        )
+                    )
+                )
+
+
+                if min_value is not None:
+
+                    min_values.append(
+                        min_value
+                    )
+
+
+                if max_value is not None:
+
+                    max_values.append(
+                        max_value
+                    )
+
+
+        if latest:
+
+            latest_value = (
+                latest.get(
+                    "Avg"
+                )
+                if latest.get(
+                    "Avg"
+                ) is not None
+                else latest.get(
+                    "avg"
+                )
+            )
+
+
+            if latest_value is None:
+
+                latest_value = latest.get(
+                    "qty"
+                )
+
+
+            parsed[
+                "heart_rate"
+            ] = {
+                "latest_bpm":
+                    round_number(
+                        latest_value
+                    ),
+
+                "min_bpm":
+                    round_number(
+                        min(
+                            min_values
+                        )
+                    )
+                    if min_values
+                    else None,
+
+                "max_bpm":
+                    round_number(
+                        max(
+                            max_values
+                        )
+                    )
+                    if max_values
+                    else None,
+
+                "recorded_at":
+                    latest.get(
+                        "date"
+                    )
+            }
+
+
+    # -------------------------
+    # 静息心率
+    # -------------------------
+
+    resting_metric = metrics.get(
+        "resting_heart_rate"
+    )
+
+
+    if isinstance(
+        resting_metric,
+        dict
+    ):
+
+        latest_resting = latest_metric_item(
+            resting_metric.get(
+                "data",
+                []
+            )
+        )
+
+
+        if latest_resting:
+
+            parsed.setdefault(
+                "heart_rate",
+                {}
+            )
+
+
+            parsed[
+                "heart_rate"
+            ][
+                "resting_bpm"
+            ] = round_number(
+                latest_resting.get(
+                    "qty"
+                )
+            )
+
+
+    # -------------------------
+    # 血氧
+    # -------------------------
+
+    oxygen_metric = metrics.get(
+        "blood_oxygen_saturation"
+    )
+
+
+    if isinstance(
+        oxygen_metric,
+        dict
+    ):
+
+        oxygen_items = oxygen_metric.get(
+            "data",
+            []
+        )
+
+
+        latest_oxygen = latest_metric_item(
+            oxygen_items
+        )
+
+
+        oxygen_values = []
+
+
+        if isinstance(
+            oxygen_items,
+            list
+        ):
+
+            for item in oxygen_items:
+
+                if not isinstance(
+                    item,
+                    dict
+                ):
+
+                    continue
+
+
+                value = normalize_percent(
+                    item.get(
+                        "qty"
+                    )
+                )
+
+
+                if value is not None:
+
+                    oxygen_values.append(
+                        value
+                    )
+
+
+        if latest_oxygen:
+
+            latest_percent = normalize_percent(
+                latest_oxygen.get(
+                    "qty"
+                )
+            )
+
+
+            parsed[
+                "oxygen"
+            ] = {
+                "latest_percent":
+                    latest_percent,
+
+                "min_percent":
+                    min(
+                        oxygen_values
+                    )
+                    if oxygen_values
+                    else latest_percent,
+
+                "max_percent":
+                    max(
+                        oxygen_values
+                    )
+                    if oxygen_values
+                    else latest_percent,
+
+                "recorded_at":
+                    latest_oxygen.get(
+                        "date"
+                    )
+            }
+
+
+    # -------------------------
+    # 步数
+    # -------------------------
+
+    steps_metric = metrics.get(
+        "step_count"
+    )
+
+
+    if isinstance(
+        steps_metric,
+        dict
+    ):
+
+        step_items = steps_metric.get(
+            "data",
+            []
+        )
+
+
+        valid_steps = [
+            item
+            for item in step_items
+            if isinstance(
+                item,
+                dict
+            )
+        ] if isinstance(
+            step_items,
+            list
+        ) else []
+
+
+        if valid_steps:
+
+            latest_step = latest_metric_item(
+                valid_steps
+            )
+
+
+            latest_date = str(
+                latest_step.get(
+                    "date",
+                    ""
+                )
+            )[:10]
+
+
+            same_day = []
+
+
+            for item in valid_steps:
+
+                item_date = str(
+                    item.get(
+                        "date",
+                        ""
+                    )
+                )[:10]
+
+
+                if item_date == latest_date:
+
+                    qty = to_float(
+                        item.get(
+                            "qty"
+                        )
+                    )
+
+
+                    if qty is not None:
+
+                        same_day.append(
+                            qty
+                        )
+
+
+            total_steps = (
+                sum(
+                    same_day
+                )
+                if same_day
+                else None
+            )
+
+
+            parsed[
+                "steps"
+            ] = {
+                "count":
+                    int(
+                        round(
+                            total_steps
+                        )
+                    )
+                    if total_steps is not None
+                    else None,
+
+                "date":
+                    latest_date
+                    or None
+            }
+
+
+    # -------------------------
+    # 睡眠
+    # -------------------------
+
+    sleep_metric = metrics.get(
+        "sleep_analysis"
+    )
+
+
+    if isinstance(
+        sleep_metric,
+        dict
+    ):
+
+        latest_sleep = latest_metric_item(
+            sleep_metric.get(
+                "data",
+                []
+            )
+        )
+
+
+        if latest_sleep:
+
+            total_hours = (
+                latest_sleep.get(
+                    "totalSleep"
+                )
+                if latest_sleep.get(
+                    "totalSleep"
+                ) is not None
+                else latest_sleep.get(
+                    "asleep"
+                )
+            )
+
+
+            parsed[
+                "sleep"
+            ] = {
+                "status":
+                    "ok",
+
+                "date":
+                    latest_sleep.get(
+                        "date"
+                    ),
+
+                "total_minutes":
+                    hours_to_minutes(
+                        total_hours
+                    ),
+
+                "deep_minutes":
+                    hours_to_minutes(
+                        latest_sleep.get(
+                            "deep"
+                        )
+                    ),
+
+                "light_minutes":
+                    hours_to_minutes(
+                        latest_sleep.get(
+                            "core"
+                        )
+                    ),
+
+                "rem_minutes":
+                    hours_to_minutes(
+                        latest_sleep.get(
+                            "rem"
+                        )
+                    ),
+
+                "awake_minutes":
+                    hours_to_minutes(
+                        latest_sleep.get(
+                            "awake"
+                        )
+                    ),
+
+                "sleep_start":
+                    latest_sleep.get(
+                        "sleepStart"
+                    ),
+
+                "sleep_end":
+                    latest_sleep.get(
+                        "sleepEnd"
+                    )
+            }
+
+
+    return parsed
+
+
 # =========================
 # 健康数据 HTTP 接口
 # =========================
@@ -1052,11 +1754,10 @@ async def health_upload(
 ):
 
     # 上传健康数据必须验证 AUTH_TOKEN。
-    # 以后 Health Auto Export / 快捷指令会把：
+    # Health Auto Export 可添加自定义 Header：
     #
     #   Authorization: Bearer 你的 AUTH_TOKEN
     #
-    # 一起发送过来。
     if not AUTH_TOKEN:
 
         raise HTTPException(
@@ -1100,6 +1801,31 @@ async def health_upload(
         )
 
 
+    # Health Auto Export JSON V2：
+    # {
+    #   "data": {
+    #       "metrics": [...]
+    #   }
+    # }
+    #
+    # 如果不是这个结构，就继续兼容我们前面测试成功的
+    # 自定义 JSON：
+    # {
+    #   "heart_rate": {...},
+    #   "oxygen": {...},
+    #   "steps": {...},
+    #   "sleep": {...}
+    # }
+    normalized = parse_health_auto_export(
+        payload
+    )
+
+
+    if normalized is None:
+
+        normalized = payload
+
+
     current = read_health_data()
 
 
@@ -1110,7 +1836,7 @@ async def health_upload(
 
     merged = merge_dict(
         current,
-        payload
+        normalized
     )
 
 
@@ -1124,7 +1850,9 @@ async def health_upload(
     )
 
 
-    if not merged.get("source"):
+    if not merged.get(
+        "source"
+    ):
 
         merged["source"] = (
             "apple_health"
@@ -1137,9 +1865,37 @@ async def health_upload(
 
 
     return {
-        "ok": True,
+        "ok":
+            True,
+
+        "source":
+            merged.get(
+                "source"
+            ),
+
         "received_at":
-            merged["received_at"]
+            merged[
+                "received_at"
+            ],
+
+        "parsed":
+            {
+                "heart_rate":
+                    "heart_rate"
+                    in normalized,
+
+                "oxygen":
+                    "oxygen"
+                    in normalized,
+
+                "steps":
+                    "steps"
+                    in normalized,
+
+                "sleep":
+                    "sleep"
+                    in normalized
+            }
     }
 
 
@@ -1154,9 +1910,23 @@ def get_latest_health() -> dict[str, Any]:
     当用户询问自己最近的心率、静息心率、血氧、步数、睡眠，
     或希望查看整体健康记录时使用。
     数据来自穿戴设备/健康 App，仅用于查看记录，不代表医学诊断。
+    只报告工具返回的数据、记录时间和是否缺失。
+    不要仅凭这些数值自行标记“正常/异常/优秀/偏低”，
+    不要推断用户情绪、身体状态或是否佩戴了手环。
+    no_data 只表示当前没有可用记录。
     """
 
-    return read_health_data()
+    data = read_health_data()
+
+    return {
+        **data,
+        "interpretation_policy": (
+            "只报告记录本身及时间。"
+            "不要仅凭这些数值自行判断正常/异常/优秀/偏低，"
+            "不要据此推断情绪、身体状态或是否佩戴手环。"
+            "no_data 只表示当前没有可用记录。"
+        )
+    }
 
 
 @health_mcp.tool()
@@ -1165,6 +1935,8 @@ def get_heart_rate() -> dict[str, Any]:
     查询最近同步的心率记录，包括最近心率、静息心率、
     最低心率、最高心率和记录时间。
     当用户询问心率、脉搏或静息心率时使用。
+    只报告记录值和记录时间，不自行判断正常/异常，
+    不根据心率推断情绪或身体状态。
     """
 
     data = read_health_data()
@@ -1194,6 +1966,7 @@ def get_steps() -> dict[str, Any]:
     """
     查询最近同步的步数记录。
     当用户询问今天走了多少步、活动量或步数时使用。
+    只报告步数和日期，不自行把步数评价为足够、不足、偏低或优秀。
     """
 
     data = read_health_data()
@@ -1224,6 +1997,7 @@ def get_oxygen() -> dict[str, Any]:
     查询最近同步的血氧饱和度记录。
     当用户询问血氧、SpO2 或最近血氧记录时使用。
     这是穿戴设备记录，不作为医学诊断。
+    只报告血氧记录值和时间，不自行标记正常/异常/优秀。
     """
 
     data = read_health_data()
@@ -1253,8 +2027,9 @@ def get_sleep() -> dict[str, Any]:
     """
     查询最近同步的睡眠记录，包括总睡眠时长和可用的睡眠阶段。
     当用户询问昨晚睡了多久、睡眠记录或睡眠阶段时使用。
-    如果手环没有佩戴、没有同步或当前没有近期睡眠数据，
-    会返回 no_data；不能把 no_data 解释为用户没有睡觉。
+    如果当前没有近期睡眠数据，会返回 no_data。
+    no_data 只表示没有可用的手环/同步记录，
+    不能据此判断用户没有睡觉，也不能判断用户是否佩戴了手环。
     """
 
     data = read_health_data()
@@ -1305,6 +2080,8 @@ def get_health_summary() -> dict[str, Any]:
     获取适合 AI 总结的最近健康数据摘要。
     当用户询问“看看我今天/最近的身体数据”“帮我总结健康记录”
     或同时涉及心率、血氧、步数、睡眠中的多项数据时使用。
+    总结时只描述记录值、时间和缺失情况。
+    不仅凭这些数据自行给出“正常/异常/优秀/偏低”等医学或状态判断。
     """
 
     data = read_health_data()
@@ -1351,8 +2128,11 @@ def get_health_summary() -> dict[str, Any]:
             ),
 
         "note": (
-            "这些是穿戴设备/健康 App 的记录，"
-            "只用于查看和整理，不代表医学诊断。"
+            "这些是穿戴设备/健康 App 的记录。"
+            "只描述记录值、时间和缺失情况；"
+            "不要仅凭这些数值自行判断正常/异常/优秀/偏低，"
+            "也不要据此推断情绪、身体状态或是否佩戴手环。"
+            "no_data 只表示当前没有可用记录。"
         )
     }
 
