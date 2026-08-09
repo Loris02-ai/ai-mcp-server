@@ -925,6 +925,29 @@ def empty_health_data():
             "awake_minutes": None,
             "sleep_start": None,
             "sleep_end": None
+        },
+
+        "body_measurements": {
+            "weight": {
+                "value": None,
+                "unit": None,
+                "recorded_at": None
+            },
+            "body_fat_percentage": {
+                "value": None,
+                "unit": "%",
+                "recorded_at": None
+            },
+            "lean_body_mass": {
+                "value": None,
+                "unit": None,
+                "recorded_at": None
+            },
+            "height": {
+                "value": None,
+                "unit": None,
+                "recorded_at": None
+            }
         }
     }
 
@@ -1241,6 +1264,95 @@ def metric_map_from_payload(
 
 
     return result
+
+
+def metric_by_names(
+    metrics,
+    names
+):
+
+    for name in names:
+
+        metric = metrics.get(
+            name
+        )
+
+        if isinstance(
+            metric,
+            dict
+        ):
+
+            return metric
+
+
+    return None
+
+
+def latest_simple_measurement(
+    metric,
+    percent=False
+):
+
+    if not isinstance(
+        metric,
+        dict
+    ):
+
+        return None
+
+
+    latest = latest_metric_item(
+        metric.get(
+            "data",
+            []
+        )
+    )
+
+
+    if not latest:
+
+        return None
+
+
+    raw_value = latest.get(
+        "qty"
+    )
+
+
+    value = (
+        normalize_percent(
+            raw_value
+        )
+        if percent
+        else round_number(
+            raw_value,
+            2
+        )
+    )
+
+
+    if value is None:
+
+        return None
+
+
+    unit = metric.get(
+        "units"
+    )
+
+
+    if percent:
+
+        unit = "%"
+
+
+    return {
+        "value": value,
+        "unit": unit,
+        "recorded_at": latest.get(
+            "date"
+        )
+    }
 
 
 def parse_health_auto_export(
@@ -1726,6 +1838,98 @@ def parse_health_auto_export(
             }
 
 
+    # -------------------------
+    # 身体测量
+    # -------------------------
+
+    body_measurements = {}
+
+
+    weight_metric = metric_by_names(
+        metrics,
+        [
+            "weight_&_body_mass",
+            "weight_body_mass",
+            "body_mass",
+            "weight"
+        ]
+    )
+
+    weight = latest_simple_measurement(
+        weight_metric
+    )
+
+    if weight:
+
+        body_measurements[
+            "weight"
+        ] = weight
+
+
+    body_fat_metric = metric_by_names(
+        metrics,
+        [
+            "body_fat_percentage",
+            "body_fat"
+        ]
+    )
+
+    body_fat = latest_simple_measurement(
+        body_fat_metric,
+        percent=True
+    )
+
+    if body_fat:
+
+        body_measurements[
+            "body_fat_percentage"
+        ] = body_fat
+
+
+    lean_body_mass_metric = metric_by_names(
+        metrics,
+        [
+            "lean_body_mass",
+            "lean_mass"
+        ]
+    )
+
+    lean_body_mass = latest_simple_measurement(
+        lean_body_mass_metric
+    )
+
+    if lean_body_mass:
+
+        body_measurements[
+            "lean_body_mass"
+        ] = lean_body_mass
+
+
+    height_metric = metric_by_names(
+        metrics,
+        [
+            "height"
+        ]
+    )
+
+    height = latest_simple_measurement(
+        height_metric
+    )
+
+    if height:
+
+        body_measurements[
+            "height"
+        ] = height
+
+
+    if body_measurements:
+
+        parsed[
+            "body_measurements"
+        ] = body_measurements
+
+
     return parsed
 
 
@@ -1814,7 +2018,8 @@ async def health_upload(
     #   "heart_rate": {...},
     #   "oxygen": {...},
     #   "steps": {...},
-    #   "sleep": {...}
+    #   "sleep": {...},
+    #   "body_measurements": {...}
     # }
     normalized = parse_health_auto_export(
         payload
@@ -1894,6 +2099,10 @@ async def health_upload(
 
                 "sleep":
                     "sleep"
+                    in normalized,
+
+                "body_measurements":
+                    "body_measurements"
                     in normalized
             }
     }
@@ -1908,6 +2117,7 @@ def get_latest_health() -> dict[str, Any]:
     """
     查询最近一次已经同步到服务器的健康数据总览。
     当用户询问自己最近的心率、静息心率、血氧、步数、睡眠，
+    或体重、体脂百分比、去脂体重、身高等身体测量，
     或希望查看整体健康记录时使用。
     数据来自穿戴设备/健康 App，仅用于查看记录，不代表医学诊断。
     只报告工具返回的数据、记录时间和是否缺失。
@@ -1924,6 +2134,8 @@ def get_latest_health() -> dict[str, Any]:
             "只报告记录本身及时间。"
             "不要仅凭这些数值自行判断正常/异常/优秀/偏低，"
             "不要据此推断情绪、身体状态或是否佩戴手环。"
+            "对体重、体脂、去脂体重和身高只报告记录，"
+            "不要评价身材、胖瘦或理想体重，也不要提供减重或减脂建议。"
             "no_data 只表示当前没有可用记录。"
         )
     }
@@ -2075,11 +2287,61 @@ def get_sleep() -> dict[str, Any]:
 
 
 @health_mcp.tool()
+def get_body_measurements() -> dict[str, Any]:
+    """
+    查询最近同步的身体测量记录，包括体重、体脂百分比、
+    去脂体重和身高，以及每项记录的单位和时间。
+    当用户询问自己的体重、脂肪率/体脂率、去脂体重、瘦体重或身高时使用。
+    只报告工具实际返回的记录值、单位和时间。
+    不评价身材、胖瘦、外形或理想体重，
+    也不要基于这些记录提供减重、减脂或限制饮食建议。
+    """
+
+    data = read_health_data()
+
+    body_measurements = data.get(
+        "body_measurements",
+        {}
+    )
+
+
+    if not isinstance(
+        body_measurements,
+        dict
+    ):
+
+        body_measurements = {}
+
+
+    return {
+        "status":
+            data.get(
+                "status",
+                "no_data"
+            ),
+
+        "received_at":
+            data.get(
+                "received_at"
+            ),
+
+        "body_measurements":
+            body_measurements,
+
+        "important_note": (
+            "只报告记录值、单位和时间。"
+            "不要评价身材、胖瘦、外形或理想体重，"
+            "也不要基于这些记录提供减重或减脂建议。"
+        )
+    }
+
+
+@health_mcp.tool()
 def get_health_summary() -> dict[str, Any]:
     """
     获取适合 AI 总结的最近健康数据摘要。
     当用户询问“看看我今天/最近的身体数据”“帮我总结健康记录”
-    或同时涉及心率、血氧、步数、睡眠中的多项数据时使用。
+    或同时涉及心率、血氧、步数、睡眠、身体测量中的多项数据时使用。
     总结时只描述记录值、时间和缺失情况。
     不仅凭这些数据自行给出“正常/异常/优秀/偏低”等医学或状态判断。
     """
@@ -2127,11 +2389,19 @@ def get_health_summary() -> dict[str, Any]:
                 {}
             ),
 
+        "body_measurements":
+            data.get(
+                "body_measurements",
+                {}
+            ),
+
         "note": (
             "这些是穿戴设备/健康 App 的记录。"
             "只描述记录值、时间和缺失情况；"
             "不要仅凭这些数值自行判断正常/异常/优秀/偏低，"
             "也不要据此推断情绪、身体状态或是否佩戴手环。"
+            "对体重、体脂、去脂体重和身高只报告记录，"
+            "不要评价身材、胖瘦或理想体重，也不要提供减重或减脂建议。"
             "no_data 只表示当前没有可用记录。"
         )
     }
