@@ -2007,6 +2007,103 @@ def calculate_period_summary(
     }
 
 
+def get_cycle_debug_info(payload):
+    """
+    仅返回月经周期跟踪 payload 的结构信息用于排错。
+    不返回日期、经量、症状内容或任何具体健康记录值。
+    """
+
+    root_keys = (
+        sorted(
+            str(key)
+            for key in payload.keys()
+        )
+        if isinstance(payload, dict)
+        else []
+    )
+
+    data = (
+        payload.get("data")
+        if isinstance(payload, dict)
+        else None
+    )
+
+    if not isinstance(data, dict):
+        return {
+            "root_keys": root_keys,
+            "has_data_object": False,
+            "data_keys": [],
+            "has_cycle_tracking": False,
+            "cycle_tracking_count": 0,
+            "cycle_names": [],
+            "cycle_item_keys": []
+        }
+
+    data_keys = sorted(
+        str(key)
+        for key in data.keys()
+    )
+
+    entries = data.get(
+        "cycleTracking"
+    )
+
+    if not isinstance(entries, list):
+        return {
+            "root_keys": root_keys,
+            "has_data_object": True,
+            "data_keys": data_keys,
+            "has_cycle_tracking": False,
+            "cycle_tracking_count": 0,
+            "cycle_names": [],
+            "cycle_item_keys": []
+        }
+
+    names = []
+    item_keys = set()
+
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+
+        for key in entry.keys():
+            item_keys.add(
+                str(key)
+            )
+
+        name = entry.get(
+            "name"
+        )
+
+        if name is not None:
+            name_text = str(
+                name
+            ).strip()
+
+            if (
+                name_text
+                and
+                name_text not in names
+            ):
+                names.append(
+                    name_text
+                )
+
+    return {
+        "root_keys": root_keys,
+        "has_data_object": True,
+        "data_keys": data_keys,
+        "has_cycle_tracking": True,
+        "cycle_tracking_count": len(
+            entries
+        ),
+        "cycle_names": names,
+        "cycle_item_keys": sorted(
+            item_keys
+        )
+    }
+
+
 def parse_cycle_tracking(
     payload,
     existing_period_tracking=None
@@ -2981,7 +3078,12 @@ async def health_upload(
                 "period_tracking":
                     "period_tracking"
                     in normalized
-            }
+            },
+
+        "cycle_debug":
+            get_cycle_debug_info(
+                payload
+            )
     }
 
 
