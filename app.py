@@ -2,7 +2,7 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 import contextlib
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -948,6 +948,14 @@ def empty_health_data():
                 "unit": None,
                 "recorded_at": None
             }
+        },
+
+        "period_tracking": {
+            "status": "no_data",
+            "last_period": None,
+            "recent_period_starts": [],
+            "daily_records": [],
+            "prediction": None
         }
     }
 
@@ -1352,6 +1360,826 @@ def latest_simple_measurement(
         "recorded_at": latest.get(
             "date"
         )
+    }
+
+
+
+# =========================
+# 月经周期跟踪解析与预测
+# =========================
+#
+# 只读取 Health Auto Export 的 Menstrual Flow（月经记录）。
+# 不保存症状、性行为、妊娠/排卵测试等其他周期跟踪项目。
+#
+# 预测规则：
+# - 预测经期：根据最近最多 6 个有效周期的起始间隔取平均值
+# - 预测排卵日：预计下次经期开始日前 13 天
+# - 预测排卵期：根据最近周期长度的最短/最长波动，
+#   给出“可能的预计排卵日期范围”
+#
+# 所有预测都只是基于历史记录的日历估算，
+# 不能确认实际排卵，也不用于诊断或避孕判断。
+# =========================
+
+def parse_export_datetime(
+    value
+):
+
+    if not value:
+
+        return None
+
+
+    text_value = str(
+        value
+    ).strip()
+
+
+    formats = [
+        "%Y-%m-%d %H:%M:%S %z",
+        "%Y-%m-%dT%H:%M:%S%z",
+        "%Y-%m-%d"
+    ]
+
+
+    for fmt in formats:
+
+        try:
+
+            return datetime.strptime(
+                text_value,
+                fmt
+            )
+
+        except Exception:
+
+            pass
+
+
+    try:
+
+        return datetime.fromisoformat(
+            text_value
+        )
+
+    except Exception:
+
+        return None
+
+
+def expand_entry_dates(
+    start_dt,
+    end_dt
+):
+
+    if start_dt is None:
+
+        return []
+
+
+    start_day = start_dt.date()
+
+    end_day = (
+        end_dt.date()
+        if end_dt is not None
+        else start_day
+    )
+
+
+    if end_day < start_day:
+
+        end_day = start_day
+
+
+    days = []
+
+    current_day = start_day
+
+
+    while (
+        current_day <= end_day
+        and
+        len(days) < 31
+    ):
+
+        days.append(
+            current_day
+        )
+
+        current_day = (
+            current_day
+            + timedelta(days=1)
+        )
+
+
+    return days
+
+
+def flow_rank(
+    value
+):
+
+    ranks = {
+        "none": 0,
+        "unspecified": 1,
+        "light": 2,
+        "medium": 3,
+        "heavy": 4
+    }
+
+
+    return ranks.get(
+        str(value).strip().lower(),
+        1
+    )
+
+
+def merge_daily_period_records(
+    existing_records,
+    incoming_records
+):
+
+    merged = {}
+
+
+    for source_records in [
+        existing_records,
+        incoming_records
+    ]:
+
+        if not isinstance(
+            source_records,
+            list
+        ):
+
+            continue
+
+
+        for item in source_records:
+
+            if not isinstance(
+                item,
+                dict
+            ):
+
+                continue
+
+
+            day = str(
+                item.get(
+                    "date",
+                    ""
+                )
+            )[:10]
+
+
+            if not day:
+
+                continue
+
+
+            previous = merged.get(
+                day
+            )
+
+
+            if previous is None:
+
+                merged[
+                    day
+                ] = {
+                    "date":
+                        day,
+
+                    "flow":
+                        item.get(
+                            "flow"
+                        ),
+
+                    "is_cycle_start":
+                        bool(
+                            item.get(
+                                "is_cycle_start",
+                                False
+                            )
+                        )
+                }
+
+                continue
+
+
+            if flow_rank(
+                item.get(
+                    "flow"
+                )
+            ) > flow_rank(
+                previous.get(
+                    "flow"
+                )
+            ):
+
+                previous[
+                    "flow"
+                ] = item.get(
+                    "flow"
+                )
+
+
+            if item.get(
+                "is_cycle_start"
+            ):
+
+                previous[
+                    "is_cycle_start"
+                ] = True
+
+
+    return [
+        merged[
+            key
+        ]
+        for key in sorted(
+            merged.keys()
+        )
+    ]
+
+
+def group_period_days(
+    daily_records
+):
+
+    dated = []
+
+
+    for item in daily_records:
+
+        if not isinstance(
+            item,
+            dict
+        ):
+
+            continue
+
+
+        try:
+
+            day = datetime.strptime(
+                str(
+                    item.get(
+                        "date",
+                        ""
+                    )
+                )[:10],
+                "%Y-%m-%d"
+            ).date()
+
+        except Exception:
+
+            continue
+
+
+        dated.append(
+            (
+                day,
+                item
+            )
+        )
+
+
+    dated.sort(
+        key=lambda pair:
+            pair[0]
+    )
+
+
+    groups = []
+
+
+    for day, item in dated:
+
+        if not groups:
+
+            groups.append(
+                [
+                    (
+                        day,
+                        item
+                    )
+                ]
+            )
+
+            continue
+
+
+        previous_day = (
+            groups[-1][-1][0]
+        )
+
+
+        gap = (
+            day
+            - previous_day
+        ).days
+
+
+        # 允许中间漏记 1 天，避免把同一次经期错误拆成两段。
+        if gap <= 2:
+
+            groups[-1].append(
+                (
+                    day,
+                    item
+                )
+            )
+
+        else:
+
+            groups.append(
+                [
+                    (
+                        day,
+                        item
+                    )
+                ]
+            )
+
+
+    return groups
+
+
+def calculate_period_summary(
+    daily_records
+):
+
+    groups = group_period_days(
+        daily_records
+    )
+
+
+    if not groups:
+
+        return {
+            "last_period": None,
+            "recent_period_starts": [],
+            "prediction": None
+        }
+
+
+    periods = []
+
+
+    for group in groups:
+
+        start_day = group[0][0]
+        end_day = group[-1][0]
+
+        explicit_starts = [
+            day
+            for day, item in group
+            if item.get(
+                "is_cycle_start"
+            )
+        ]
+
+
+        actual_start = (
+            min(
+                explicit_starts
+            )
+            if explicit_starts
+            else start_day
+        )
+
+
+        periods.append(
+            {
+                "start_date":
+                    actual_start.isoformat(),
+
+                "end_date":
+                    end_day.isoformat(),
+
+                "duration_days":
+                    (
+                        end_day
+                        - actual_start
+                    ).days
+                    + 1
+            }
+        )
+
+
+    periods.sort(
+        key=lambda item:
+            item[
+                "start_date"
+            ]
+    )
+
+
+    last_period = periods[-1]
+
+
+    recent_starts = [
+        item[
+            "start_date"
+        ]
+        for item in periods[-8:]
+    ]
+
+
+    cycle_intervals = []
+
+
+    for index in range(
+        1,
+        len(periods)
+    ):
+
+        try:
+
+            previous = datetime.strptime(
+                periods[
+                    index - 1
+                ][
+                    "start_date"
+                ],
+                "%Y-%m-%d"
+            ).date()
+
+            current = datetime.strptime(
+                periods[
+                    index
+                ][
+                    "start_date"
+                ],
+                "%Y-%m-%d"
+            ).date()
+
+        except Exception:
+
+            continue
+
+
+        interval = (
+            current
+            - previous
+        ).days
+
+
+        if 15 <= interval <= 90:
+
+            cycle_intervals.append(
+                interval
+            )
+
+
+    recent_intervals = (
+        cycle_intervals[-6:]
+    )
+
+
+    period_lengths = [
+        item[
+            "duration_days"
+        ]
+        for item in periods[-6:]
+        if 1 <= item.get(
+            "duration_days",
+            0
+        ) <= 15
+    ]
+
+
+    prediction = None
+
+
+    if recent_intervals:
+
+        last_start = datetime.strptime(
+            last_period[
+                "start_date"
+            ],
+            "%Y-%m-%d"
+        ).date()
+
+
+        average_cycle = int(
+            round(
+                sum(
+                    recent_intervals
+                )
+                / len(
+                    recent_intervals
+                )
+            )
+        )
+
+
+        average_period = (
+            int(
+                round(
+                    sum(
+                        period_lengths
+                    )
+                    / len(
+                        period_lengths
+                    )
+                )
+            )
+            if period_lengths
+            else None
+        )
+
+
+        predicted_start = (
+            last_start
+            + timedelta(
+                days=average_cycle
+            )
+        )
+
+
+        predicted_end = (
+            predicted_start
+            + timedelta(
+                days=max(
+                    average_period - 1,
+                    0
+                )
+            )
+            if average_period is not None
+            else None
+        )
+
+
+        predicted_ovulation_day = (
+            predicted_start
+            - timedelta(
+                days=13
+            )
+        )
+
+
+        shortest_cycle = min(
+            recent_intervals
+        )
+
+        longest_cycle = max(
+            recent_intervals
+        )
+
+
+        predicted_ovulation_period_start = (
+            last_start
+            + timedelta(
+                days=shortest_cycle - 13
+            )
+        )
+
+        predicted_ovulation_period_end = (
+            last_start
+            + timedelta(
+                days=longest_cycle - 13
+            )
+        )
+
+
+        prediction = {
+            "predicted_period_start":
+                predicted_start.isoformat(),
+
+            "predicted_period_end":
+                (
+                    predicted_end.isoformat()
+                    if predicted_end is not None
+                    else None
+                ),
+
+            "predicted_ovulation_day":
+                predicted_ovulation_day.isoformat(),
+
+            "predicted_ovulation_period_start":
+                predicted_ovulation_period_start.isoformat(),
+
+            "predicted_ovulation_period_end":
+                predicted_ovulation_period_end.isoformat(),
+
+            "average_cycle_length_days":
+                average_cycle,
+
+            "average_period_length_days":
+                average_period,
+
+            "cycle_interval_min_days":
+                shortest_cycle,
+
+            "cycle_interval_max_days":
+                longest_cycle,
+
+            "based_on_cycle_intervals":
+                len(
+                    recent_intervals
+                ),
+
+            "method":
+                "calendar_estimate_from_logged_period_history",
+
+            "important_note":
+                (
+                    "预测经期、预测排卵日和预测排卵期"
+                    "都只是根据已记录经期历史进行的日历估算。"
+                    "它们不代表实际已经发生，也不能确认实际排卵，"
+                    "不用于诊断或避孕判断。"
+                )
+        }
+
+
+    return {
+        "last_period":
+            last_period,
+
+        "recent_period_starts":
+            recent_starts,
+
+        "prediction":
+            prediction
+    }
+
+
+def parse_cycle_tracking(
+    payload,
+    existing_period_tracking=None
+):
+
+    data = payload.get(
+        "data",
+        {}
+    )
+
+
+    if not isinstance(
+        data,
+        dict
+    ):
+
+        return None
+
+
+    entries = data.get(
+        "cycleTracking",
+        []
+    )
+
+
+    if not isinstance(
+        entries,
+        list
+    ):
+
+        return None
+
+
+    incoming_records = []
+
+
+    for entry in entries:
+
+        if not isinstance(
+            entry,
+            dict
+        ):
+
+            continue
+
+
+        name = str(
+            entry.get(
+                "name",
+                ""
+            )
+        ).strip().lower()
+
+
+        if name not in {
+            "menstrual flow",
+            "menstrual_flow"
+        }:
+
+            continue
+
+
+        flow = str(
+            entry.get(
+                "value",
+                "Unspecified"
+            )
+        ).strip()
+
+
+        if flow.lower() == "none":
+
+            continue
+
+
+        start_dt = parse_export_datetime(
+            entry.get(
+                "start"
+            )
+        )
+
+        end_dt = parse_export_datetime(
+            entry.get(
+                "end"
+            )
+        )
+
+
+        entry_days = expand_entry_dates(
+            start_dt,
+            end_dt
+        )
+
+
+        for index, day in enumerate(
+            entry_days
+        ):
+
+            incoming_records.append(
+                {
+                    "date":
+                        day.isoformat(),
+
+                    "flow":
+                        flow,
+
+                    "is_cycle_start":
+                        bool(
+                            entry.get(
+                                "isCycleStart",
+                                False
+                            )
+                        )
+                        and
+                        index == 0
+                }
+            )
+
+
+    if not incoming_records:
+
+        return None
+
+
+    existing_records = []
+
+
+    if isinstance(
+        existing_period_tracking,
+        dict
+    ):
+
+        existing_records = (
+            existing_period_tracking.get(
+                "daily_records",
+                []
+            )
+        )
+
+
+    merged_records = merge_daily_period_records(
+        existing_records,
+        incoming_records
+    )
+
+
+    summary = calculate_period_summary(
+        merged_records
+    )
+
+
+    return {
+        "status":
+            "ok",
+
+        "last_period":
+            summary.get(
+                "last_period"
+            ),
+
+        "recent_period_starts":
+            summary.get(
+                "recent_period_starts",
+                []
+            ),
+
+        "daily_records":
+            merged_records,
+
+        "prediction":
+            summary.get(
+                "prediction"
+            )
     }
 
 
@@ -2005,38 +2833,83 @@ async def health_upload(
         )
 
 
-    # Health Auto Export JSON V2：
-    # {
-    #   "data": {
-    #       "metrics": [...]
-    #   }
-    # }
-    #
-    # 如果不是这个结构，就继续兼容我们前面测试成功的
-    # 自定义 JSON：
-    # {
-    #   "heart_rate": {...},
-    #   "oxygen": {...},
-    #   "steps": {...},
-    #   "sleep": {...},
-    #   "body_measurements": {...}
-    # }
-    normalized = parse_health_auto_export(
-        payload
-    )
-
-
-    if normalized is None:
-
-        normalized = payload
-
-
     current = read_health_data()
 
 
     if current.get("status") != "ok":
 
         current = empty_health_data()
+
+
+    # Health Auto Export JSON V2 可能是：
+    # 1. 健康指标：data.metrics[]
+    # 2. 月经周期跟踪：data.cycleTracking[]
+    #
+    # 两种自动化都可以 POST 到同一个 /health/upload。
+    normalized = {}
+
+
+    health_normalized = (
+        parse_health_auto_export(
+            payload
+        )
+    )
+
+
+    if isinstance(
+        health_normalized,
+        dict
+    ):
+
+        normalized = merge_dict(
+            normalized,
+            health_normalized
+        )
+
+
+    period_tracking = (
+        parse_cycle_tracking(
+            payload,
+            current.get(
+                "period_tracking"
+            )
+        )
+    )
+
+
+    if isinstance(
+        period_tracking,
+        dict
+    ):
+
+        normalized[
+            "period_tracking"
+        ] = period_tracking
+
+        normalized[
+            "source"
+        ] = (
+            "health_auto_export"
+        )
+
+
+    if not normalized:
+
+        if isinstance(
+            payload.get(
+                "data"
+            ),
+            dict
+        ):
+
+            normalized = {
+                "source":
+                    "health_auto_export"
+            }
+
+        else:
+
+            normalized = payload
 
 
     merged = merge_dict(
@@ -2103,6 +2976,10 @@ async def health_upload(
 
                 "body_measurements":
                     "body_measurements"
+                    in normalized,
+
+                "period_tracking":
+                    "period_tracking"
                     in normalized
             }
     }
@@ -2128,14 +3005,25 @@ def get_latest_health() -> dict[str, Any]:
 
     data = read_health_data()
 
+    general_data = dict(
+        data
+    )
+
+    general_data.pop(
+        "period_tracking",
+        None
+    )
+
+
     return {
-        **data,
+        **general_data,
         "interpretation_policy": (
             "只报告记录本身及时间。"
             "不要仅凭这些数值自行判断正常/异常/优秀/偏低，"
             "不要据此推断情绪、身体状态或是否佩戴手环。"
             "对体重、体脂、去脂体重和身高只报告记录，"
             "不要评价身材、胖瘦或理想体重，也不要提供减重或减脂建议。"
+            "经期数据只有在用户明确询问时才调用 get_period。"
             "no_data 只表示当前没有可用记录。"
         )
     }
@@ -2337,6 +3225,64 @@ def get_body_measurements() -> dict[str, Any]:
 
 
 @health_mcp.tool()
+def get_period() -> dict[str, Any]:
+    """
+    查询月经周期记录和基于历史记录生成的预测。
+    当用户明确询问经期、月经记录、预测经期、排卵日或排卵期时使用。
+
+    返回内容只包括：
+    - 实际记录：最近一次经期、最近几次经期开始日期、每日经量记录
+    - 预测：预测经期开始/结束、预测排卵日、预测排卵期
+
+    预测只是根据已记录经期历史进行的日历估算。
+    不把预测写成已经发生的事实，不确认实际排卵，
+    不用于诊断或避孕判断。
+    """
+
+    data = read_health_data()
+
+    period_tracking = data.get(
+        "period_tracking",
+        {}
+    )
+
+
+    if not isinstance(
+        period_tracking,
+        dict
+    ):
+
+        period_tracking = {
+            "status":
+                "no_data"
+        }
+
+
+    return {
+        "status":
+            period_tracking.get(
+                "status",
+                "no_data"
+            ),
+
+        "received_at":
+            data.get(
+                "received_at"
+            ),
+
+        "period_tracking":
+            period_tracking,
+
+        "important_note": (
+            "实际经期记录与预测必须分开表达。"
+            "预测经期、预测排卵日和预测排卵期"
+            "都只是基于历史经期记录的日历估算，"
+            "不能确认实际排卵，也不用于诊断或避孕判断。"
+        )
+    }
+
+
+@health_mcp.tool()
 def get_health_summary() -> dict[str, Any]:
     """
     获取适合 AI 总结的最近健康数据摘要。
@@ -2344,6 +3290,8 @@ def get_health_summary() -> dict[str, Any]:
     或同时涉及心率、血氧、步数、睡眠、身体测量中的多项数据时使用。
     总结时只描述记录值、时间和缺失情况。
     不仅凭这些数据自行给出“正常/异常/优秀/偏低”等医学或状态判断。
+    经期数据不在普通健康摘要中自动展示；
+    用户明确询问经期、月经、预测经期、排卵日或排卵期时使用 get_period。
     """
 
     data = read_health_data()
@@ -2402,6 +3350,8 @@ def get_health_summary() -> dict[str, Any]:
             "也不要据此推断情绪、身体状态或是否佩戴手环。"
             "对体重、体脂、去脂体重和身高只报告记录，"
             "不要评价身材、胖瘦或理想体重，也不要提供减重或减脂建议。"
+            "经期数据不在普通健康摘要中自动展示；"
+            "用户明确询问时应调用 get_period。"
             "no_data 只表示当前没有可用记录。"
         )
     }
