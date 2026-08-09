@@ -88,6 +88,46 @@ AUTH_TOKEN = os.environ.get(
 ).strip()
 
 
+def env_positive_int(
+    name,
+    default=None
+):
+
+    raw = os.environ.get(
+        name,
+        ""
+    ).strip()
+
+    if not raw:
+
+        return default
+
+    try:
+
+        value = int(
+            raw
+        )
+
+    except Exception:
+
+        return default
+
+    if value <= 0:
+
+        return default
+
+    return value
+
+
+PERIOD_TYPICAL_CYCLE_DAYS = env_positive_int(
+    "PERIOD_TYPICAL_CYCLE_DAYS"
+)
+
+PERIOD_TYPICAL_DURATION_DAYS = env_positive_int(
+    "PERIOD_TYPICAL_DURATION_DAYS"
+)
+
+
 # =========================
 # HTTP 工具
 # =========================
@@ -1851,10 +1891,7 @@ def calculate_period_summary(
     ]
 
 
-    prediction = None
-
-
-    if recent_intervals:
+    try:
 
         last_start = datetime.strptime(
             last_period[
@@ -1863,6 +1900,24 @@ def calculate_period_summary(
             "%Y-%m-%d"
         ).date()
 
+    except Exception:
+
+        last_start = None
+
+
+    prediction = None
+
+
+    # -------------------------
+    # 方案 A：有至少两个真实周期
+    # 优先使用真实历史间隔
+    # -------------------------
+
+    if (
+        recent_intervals
+        and
+        last_start is not None
+    ):
 
         average_cycle = int(
             round(
@@ -1888,7 +1943,7 @@ def calculate_period_summary(
                 )
             )
             if period_lengths
-            else None
+            else PERIOD_TYPICAL_DURATION_DAYS
         )
 
 
@@ -1985,12 +2040,163 @@ def calculate_period_summary(
             "method":
                 "calendar_estimate_from_logged_period_history",
 
+            "prediction_basis":
+                "logged_period_history",
+
             "important_note":
                 (
                     "预测经期、预测排卵日和预测排卵期"
                     "都只是根据已记录经期历史进行的日历估算。"
                     "它们不代表实际已经发生，也不能确认实际排卵，"
                     "不用于诊断或避孕判断。"
+                )
+        }
+
+
+    # -------------------------
+    # 方案 B：只有一个真实周期
+    # 使用 Railway 配置的“典型周期长度/典型经期长度”
+    # 作为备用日历预测。
+    #
+    # 如果上一次真实经期距离今天很久，
+    # 会按典型周期长度逐次向前推，
+    # 直到得到今天或之后的下一次预测经期。
+    # -------------------------
+
+    elif (
+        last_start is not None
+        and
+        PERIOD_TYPICAL_CYCLE_DAYS is not None
+        and
+        PERIOD_TYPICAL_DURATION_DAYS is not None
+    ):
+
+        typical_cycle = (
+            PERIOD_TYPICAL_CYCLE_DAYS
+        )
+
+        typical_period = (
+            PERIOD_TYPICAL_DURATION_DAYS
+        )
+
+
+        predicted_start = (
+            last_start
+            + timedelta(
+                days=typical_cycle
+            )
+        )
+
+
+        today = datetime.now(
+            timezone.utc
+        ).date()
+
+
+        projected_cycles = 1
+
+
+        while (
+            predicted_start < today
+            and
+            projected_cycles < 120
+        ):
+
+            predicted_start = (
+                predicted_start
+                + timedelta(
+                    days=typical_cycle
+                )
+            )
+
+            projected_cycles += 1
+
+
+        predicted_end = (
+            predicted_start
+            + timedelta(
+                days=max(
+                    typical_period - 1,
+                    0
+                )
+            )
+        )
+
+
+        predicted_ovulation_day = (
+            predicted_start
+            - timedelta(
+                days=13
+            )
+        )
+
+
+        # 只有一个真实周期时，没有真实的周期波动范围。
+        # 因此“预测排卵期”暂时退化为同一天，
+        # 明确标记为无法根据历史估计范围。
+        predicted_ovulation_period_start = (
+            predicted_ovulation_day
+        )
+
+        predicted_ovulation_period_end = (
+            predicted_ovulation_day
+        )
+
+
+        prediction = {
+            "predicted_period_start":
+                predicted_start.isoformat(),
+
+            "predicted_period_end":
+                predicted_end.isoformat(),
+
+            "predicted_ovulation_day":
+                predicted_ovulation_day.isoformat(),
+
+            "predicted_ovulation_period_start":
+                predicted_ovulation_period_start.isoformat(),
+
+            "predicted_ovulation_period_end":
+                predicted_ovulation_period_end.isoformat(),
+
+            "average_cycle_length_days":
+                typical_cycle,
+
+            "average_period_length_days":
+                typical_period,
+
+            "cycle_interval_min_days":
+                None,
+
+            "cycle_interval_max_days":
+                None,
+
+            "based_on_cycle_intervals":
+                0,
+
+            "projected_cycles_from_last_record":
+                projected_cycles,
+
+            "method":
+                "calendar_estimate_from_configured_typical_cycle",
+
+            "prediction_basis":
+                "configured_typical_cycle_fallback",
+
+            "ovulation_period_range_status":
+                "single_day_only_insufficient_history_for_range",
+
+            "important_note":
+                (
+                    "当前真实经期历史不足两个周期，"
+                    "所以这组预测使用 Railway 中配置的典型周期长度"
+                    "和典型经期长度进行备用日历推算。"
+                    "预测经期、预测排卵日和预测排卵期"
+                    "都不是实际发生记录，也不能确认实际排卵。"
+                    "由于没有足够的真实周期波动数据，"
+                    "预测排卵期暂时只显示预测排卵日这一天，"
+                    "不额外虚构范围。"
+                    "这些预测不用于诊断或避孕判断。"
                 )
         }
 
@@ -3235,7 +3441,9 @@ def get_period() -> dict[str, Any]:
     - 实际记录：最近一次经期、最近几次经期开始日期、每日经量记录
     - 预测：预测经期开始/结束、预测排卵日、预测排卵期
 
-    预测只是根据已记录经期历史进行的日历估算。
+    预测优先根据已记录经期历史进行日历估算。
+    如果真实历史不足两个周期，服务器可能使用管理员配置的
+    典型周期长度与典型经期长度进行备用日历预测。
     不把预测写成已经发生的事实，不确认实际排卵，
     不用于诊断或避孕判断。
     """
@@ -3276,9 +3484,11 @@ def get_period() -> dict[str, Any]:
 
         "important_note": (
             "实际经期记录与预测必须分开表达。"
+            "预测优先基于真实经期历史；"
+            "历史不足时可能使用服务器配置的典型周期参数进行备用推算。"
             "预测经期、预测排卵日和预测排卵期"
-            "都只是基于历史经期记录的日历估算，"
-            "不能确认实际排卵，也不用于诊断或避孕判断。"
+            "都不是实际发生记录，不能确认实际排卵，"
+            "也不用于诊断或避孕判断。"
         )
     }
 
