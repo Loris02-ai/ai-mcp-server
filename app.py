@@ -1,6 +1,8 @@
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 
+import asyncio
 import contextlib
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -17,6 +19,7 @@ import uvicorn
 from urllib.parse import quote
 from urllib.request import Request as URLRequest
 from urllib.request import urlopen
+from urllib.error import HTTPError, URLError
 
 
 # =========================
@@ -4832,6 +4835,314 @@ async def mcp(
         }
 
     }
+
+
+# =========================
+# SiliconFlow GLM-5.2 低推理代理
+# =========================
+#
+# Echoes 的 API Endpoint 可填写：
+#   https://你的-Railway-域名/siliconflow/v1
+#
+# 代理不会保存 API Key；它只把 Echoes 发来的 Authorization
+# 原样转发给 SiliconFlow。
+#
+# 仅当模型名为 zai-org/GLM-5.2 时，自动把 thinking_budget
+# 限制为 GLM_THINKING_BUDGET（默认 2048）。
+# 其他模型请求原样转发，不强行修改。
+#
+# 如果以后想改预算，不必改代码，只需在 Railway Variables 里设置：
+#   GLM_THINKING_BUDGET=3072
+# 或其他正整数。
+#
+
+SILICONFLOW_UPSTREAM = (
+    os.environ.get(
+        "SILICONFLOW_UPSTREAM",
+        "https://api.siliconflow.cn/v1"
+    )
+    .strip()
+    .rstrip("/")
+)
+
+
+def _read_thinking_budget():
+
+    raw = os.environ.get(
+        "GLM_THINKING_BUDGET",
+        "2048"
+    ).strip()
+
+    try:
+        value = int(raw)
+    except Exception:
+        value = 2048
+
+    # SiliconFlow 文档给出的 thinking_budget 有有效范围；
+    # 这里做一个保守的保护，避免误填 0 或极端数值。
+    if value < 128:
+        value = 128
+
+    if value > 32768:
+        value = 32768
+
+    return value
+
+
+def _should_limit_thinking(payload):
+
+    if not isinstance(
+        payload,
+        dict
+    ):
+        return False
+
+    model = str(
+        payload.get(
+            "model",
+            ""
+        )
+    ).strip().lower()
+
+    return model in {
+        "zai-org/glm-5.2",
+        "pro/zai-org/glm-5.2",
+    }
+
+
+def _proxy_http_call(
+    method,
+    upstream_url,
+    request_headers,
+    body_bytes
+):
+
+    upstream_request = URLRequest(
+        upstream_url,
+        data=(
+            body_bytes
+            if method != "GET"
+            else None
+        ),
+        method=method,
+    )
+
+    # 只转发真正需要的头，避免 Host / Content-Length 等反向代理头造成冲突。
+    for header_name in (
+        "Authorization",
+        "Content-Type",
+        "Accept",
+        "User-Agent",
+    ):
+
+        value = request_headers.get(
+            header_name
+        )
+
+        if value:
+            upstream_request.add_header(
+                header_name,
+                value
+            )
+
+    try:
+
+        with urlopen(
+            upstream_request,
+            timeout=180
+        ) as upstream_response:
+
+            return (
+                upstream_response.status,
+                upstream_response.headers.get(
+                    "Content-Type",
+                    "application/json"
+                ),
+                upstream_response.read(),
+            )
+
+    except HTTPError as exc:
+
+        return (
+            exc.code,
+            exc.headers.get(
+                "Content-Type",
+                "application/json"
+            ) if exc.headers else "application/json",
+            exc.read(),
+        )
+
+
+@app.get(
+    "/siliconflow-proxy/status"
+)
+def siliconflow_proxy_status():
+
+    return {
+        "status": "online",
+        "upstream": SILICONFLOW_UPSTREAM,
+        "endpoint": "/siliconflow/v1",
+        "model": "zai-org/GLM-5.2",
+        "thinking_budget": _read_thinking_budget(),
+        "api_key_storage": "not_stored",
+    }
+
+
+@app.api_route(
+    "/siliconflow/v1/{subpath:path}",
+    methods=[
+        "GET",
+        "POST"
+    ]
+)
+async def siliconflow_proxy(
+    subpath: str,
+    request: Request
+):
+
+    method = request.method.upper()
+
+    query_string = request.url.query
+
+    upstream_url = (
+        f"{SILICONFLOW_UPSTREAM}/"
+        f"{subpath.lstrip('/')}"
+    )
+
+    if query_string:
+        upstream_url += (
+            "?" + query_string
+        )
+
+    original_body = await request.body()
+    body_bytes = original_body
+    applied_budget = None
+
+    is_chat_completions = (
+        method == "POST"
+        and subpath.strip("/") == "chat/completions"
+    )
+
+    if (
+        is_chat_completions
+        and original_body
+    ):
+
+        try:
+            payload = json.loads(
+                original_body.decode(
+                    "utf-8"
+                )
+            )
+        except Exception:
+            payload = None
+
+        if _should_limit_thinking(
+            payload
+        ):
+
+            applied_budget = (
+                _read_thinking_budget()
+            )
+
+            # 无论 Echoes 有没有传 thinking_budget，
+            # 对 GLM-5.2 都以 Railway 上的预算为准。
+            payload[
+                "thinking_budget"
+            ] = applied_budget
+
+            body_bytes = json.dumps(
+                payload,
+                ensure_ascii=False
+            ).encode(
+                "utf-8"
+            )
+
+    try:
+
+        (
+            status_code,
+            content_type,
+            response_body
+        ) = await asyncio.to_thread(
+            _proxy_http_call,
+            method,
+            upstream_url,
+            request.headers,
+            body_bytes,
+        )
+
+    except URLError as exc:
+
+        return Response(
+            content=json.dumps(
+                {
+                    "error": {
+                        "message": (
+                            "SiliconFlow upstream unavailable: "
+                            f"{exc}"
+                        )
+                    }
+                },
+                ensure_ascii=False
+            ),
+            status_code=502,
+            media_type="application/json",
+        )
+
+    # 非流式 JSON 响应时，把 usage 打到 Railway Logs。
+    # 不改变返回给 Echoes 的内容。
+    if (
+        is_chat_completions
+        and "application/json" in content_type.lower()
+        and response_body
+    ):
+
+        try:
+            response_json = json.loads(
+                response_body.decode(
+                    "utf-8"
+                )
+            )
+
+            usage = response_json.get(
+                "usage"
+            ) or {}
+
+            print(
+                "[GLM low-thinking proxy]",
+                f"budget={applied_budget}",
+                f"prompt_tokens={usage.get('prompt_tokens')}",
+                f"completion_tokens={usage.get('completion_tokens')}",
+                f"total_tokens={usage.get('total_tokens')}",
+                f"prompt_details={usage.get('prompt_tokens_details')}",
+                f"completion_details={usage.get('completion_tokens_details')}",
+                flush=True,
+            )
+
+        except Exception:
+            pass
+
+    response_headers = {
+        "X-Echoes-GLM-Thinking-Budget": (
+            str(applied_budget)
+            if applied_budget is not None
+            else "unchanged"
+        )
+    }
+
+    # 对 SSE / JSON 都保留上游 Content-Type。
+    # 若 Echoes 发送 stream=true，本实现会先收完整上游响应再返回；
+    # 用户当前的“流式兼容模式”保持关闭即可。
+    return Response(
+        content=response_body,
+        status_code=status_code,
+        media_type=content_type.split(
+            ";",
+            1
+        )[0].strip(),
+        headers=response_headers,
+    )
 
 
 # =========================
