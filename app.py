@@ -4042,6 +4042,78 @@ def get_game_state(
         )
 
 
+def get_game_state_mcp(
+    game_id: str = "main"
+):
+    """
+    仅供 MCP 使用的紧凑棋局状态。
+    HTML 仍然使用原来的完整 get_game_state，不受影响。
+    B=用户黑棋，W=Sei 白棋。
+    """
+
+    state = get_game_state(
+        game_id
+    )
+
+    compact_stones = []
+
+    for stone in state.get(
+        "stones",
+        []
+    ):
+        side = (
+            "B"
+            if stone.get("player") == "user"
+            else "W"
+        )
+
+        compact_stones.append(
+            f"{stone.get('coordinate')}:{side}"
+        )
+
+    last_move = state.get(
+        "last_move"
+    )
+
+    last_text = "-"
+
+    if isinstance(
+        last_move,
+        dict
+    ):
+        last_side = (
+            "B"
+            if last_move.get("player") == "user"
+            else "W"
+        )
+
+        last_text = (
+            f"{last_move.get('coordinate')}:"
+            f"{last_side}"
+        )
+
+    winner = state.get(
+        "winner"
+    )
+
+    if winner == "user":
+        winner_text = "B"
+    elif winner == "sei":
+        winner_text = "W"
+    elif winner == "draw":
+        winner_text = "draw"
+    else:
+        winner_text = "-"
+
+    return (
+        f"turn={state.get('turn') or '-'};"
+        f"last={last_text};"
+        f"stones={','.join(compact_stones) or '-'};"
+        f"winner={winner_text};"
+        f"over={1 if state.get('game_over') else 0}"
+    )
+
+
 def play_gomoku_move(
     row: int,
     col: int,
@@ -4255,18 +4327,34 @@ def play_gomoku_turn(
         game_id=game_id
     )
 
-    return {
-        "ok": True,
-        "move": move_result.get(
-            "move"
-        ),
-        "message": say_result.get(
-            "message"
-        ),
-        "state": get_game_state(
-            game_id
-        )
-    }
+    final_state = get_game_state(
+        game_id
+    )
+
+    move = move_result.get(
+        "move"
+    ) or {}
+
+    winner = final_state.get(
+        "winner"
+    )
+
+    if winner == "user":
+        winner_text = "B"
+    elif winner == "sei":
+        winner_text = "W"
+    elif winner == "draw":
+        winner_text = "draw"
+    else:
+        winner_text = "-"
+
+    return (
+        "ok=1;"
+        f"move={move.get('coordinate', '-')}:W;"
+        f"next={final_state.get('turn') or '-'};"
+        f"winner={winner_text};"
+        f"over={1 if final_state.get('game_over') else 0}"
+    )
 
 def reset_gomoku(
     game_id: str = "main"
@@ -4371,12 +4459,8 @@ TOOLS = [
     {
         "name": "get_game_state",
         "description": (
-            "查看当前五子棋棋局。"
-            "用户执黑先手，Sei 执白。"
-            "返回当前轮到谁、最后一步、胜负和全部棋子坐标。"
-            "当用户只是在聊天里询问棋盘、轮到谁、谁赢了时使用。"
-            "如果用户消息已经附带 HTML 生成的完整棋盘状态，"
-            "不要为了下棋而重复调用此工具。"
+            "读取当前15×15五子棋。B=用户黑棋，W=Sei白棋。"
+            "返回turn、last、stones、winner。下棋前先调用。"
         ),
         "annotations": {
             "title": "查看五子棋棋局",
@@ -4399,12 +4483,8 @@ TOOLS = [
     {
         "name": "play_gomoku_turn",
         "description": (
-            "让 Echoes 里的 Sei 一次完成自己的五子棋回合。"
-            "一次调用同时做两件事：下一颗白棋，并把 Sei 想说的话写进棋局供 HTML 显示。"
-            "row 和 col 从 0 开始，范围 0~14；例如 H8 是 row=7、col=7。"
-            "如果用户消息已经附带 HTML 生成的完整棋盘、最后一步和 turn=sei，"
-            "请直接根据那些信息思考并调用本工具，不要先调用 get_game_state，"
-            "这样每回合只需要一次执行确认。"
+            "Sei完成一回合：落一颗白棋并写一句游戏台词。"
+            "row/col范围0~14，H8=row7,col7。先读取棋局后调用。"
         ),
         "annotations": {
             "title": "Sei 完成五子棋回合",
@@ -4504,7 +4584,7 @@ TOOLS = [
 
 FUNCTIONS = {
     "get_game_state":
-        get_game_state,
+        get_game_state_mcp,
 
     "play_gomoku_turn":
         play_gomoku_turn,
