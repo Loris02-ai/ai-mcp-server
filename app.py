@@ -4198,6 +4198,76 @@ def game_say(
         }
 
 
+
+def play_gomoku_turn(
+    row: int,
+    col: int,
+    message: str,
+    game_id: str = "main"
+):
+    """
+    让 Sei 在一次 MCP 调用中完成一整个回合：
+    先落一颗白棋，再把要对用户说的话写进棋局。
+    这样 Echoes 只需要为本回合确认一次工具调用。
+    """
+
+    game_id = str(
+        game_id
+        or "main"
+    ).strip() or "main"
+
+    message = str(
+        message
+        or ""
+    ).strip()
+
+    if not message:
+        return {
+            "ok": False,
+            "error": "message 不能为空。",
+            "state": get_game_state(
+                game_id
+            )
+        }
+
+    if len(message) > 500:
+        message = message[:500]
+
+    try:
+        move_result = _make_gomoku_move(
+            game_id,
+            row,
+            col,
+            "sei"
+        )
+
+    except ValueError as error:
+        return {
+            "ok": False,
+            "error": str(error),
+            "state": get_game_state(
+                game_id
+            )
+        }
+
+    say_result = game_say(
+        message=message,
+        game_id=game_id
+    )
+
+    return {
+        "ok": True,
+        "move": move_result.get(
+            "move"
+        ),
+        "message": say_result.get(
+            "message"
+        ),
+        "state": get_game_state(
+            game_id
+        )
+    }
+
 def reset_gomoku(
     game_id: str = "main"
 ):
@@ -4304,30 +4374,45 @@ TOOLS = [
             "查看当前五子棋棋局。"
             "用户执黑先手，Sei 执白。"
             "返回当前轮到谁、最后一步、胜负和全部棋子坐标。"
-            "当用户询问棋盘、轮到谁、谁赢了，"
-            "或 Sei 准备落子前，应先调用此工具。"
+            "当用户只是在聊天里询问棋盘、轮到谁、谁赢了时使用。"
+            "如果用户消息已经附带 HTML 生成的完整棋盘状态，"
+            "不要为了下棋而重复调用此工具。"
         ),
+        "annotations": {
+            "title": "查看五子棋棋局",
+            "readOnlyHint": True,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": False
+        },
         "inputSchema": {
             "type": "object",
             "properties": {
                 "game_id": {
                     "type": "string",
-                    "description": (
-                        "棋局编号。默认 main。"
-                    ),
+                    "description": "棋局编号。默认 main。",
                     "default": "main"
                 }
             }
         }
     },
     {
-        "name": "play_gomoku_move",
+        "name": "play_gomoku_turn",
         "description": (
-            "让 Sei 在五子棋中亲自下一颗白棋。"
-            "必须先查看棋局并确认 turn=sei。"
-            "row 和 col 都从 0 开始，范围 0~14。"
-            "例如 H8 对应 row=7、col=7。"
+            "让 Echoes 里的 Sei 一次完成自己的五子棋回合。"
+            "一次调用同时做两件事：下一颗白棋，并把 Sei 想说的话写进棋局供 HTML 显示。"
+            "row 和 col 从 0 开始，范围 0~14；例如 H8 是 row=7、col=7。"
+            "如果用户消息已经附带 HTML 生成的完整棋盘、最后一步和 turn=sei，"
+            "请直接根据那些信息思考并调用本工具，不要先调用 get_game_state，"
+            "这样每回合只需要一次执行确认。"
         ),
+        "annotations": {
+            "title": "Sei 完成五子棋回合",
+            "readOnlyHint": False,
+            "destructiveHint": False,
+            "idempotentHint": False,
+            "openWorldHint": False
+        },
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -4335,13 +4420,17 @@ TOOLS = [
                     "type": "integer",
                     "minimum": 0,
                     "maximum": 14,
-                    "description": "行号，0~14"
+                    "description": "Sei 要落子的行号，0~14"
                 },
                 "col": {
                     "type": "integer",
                     "minimum": 0,
                     "maximum": 14,
-                    "description": "列号，0~14"
+                    "description": "Sei 要落子的列号，0~14"
+                },
+                "message": {
+                    "type": "string",
+                    "description": "Sei 本回合想对用户说的一句自然的话"
                 },
                 "game_id": {
                     "type": "string",
@@ -4351,7 +4440,8 @@ TOOLS = [
             },
             "required": [
                 "row",
-                "col"
+                "col",
+                "message"
             ]
         }
     },
@@ -4359,9 +4449,18 @@ TOOLS = [
         "name": "get_game_events",
         "description": (
             "查看五子棋最近发生的事件。"
-            "用于知道用户刚刚下在哪里、游戏是否结束、"
-            "以及自上次查看后发生了哪些变化。"
+            "适合在聊天里追问用户刚才下在哪里、游戏是否结束，"
+            "或检查自某个事件编号之后发生了什么。"
+            "正常对弈时如果用户消息已经附带 HTML 生成的当前棋盘状态，"
+            "不需要额外调用本工具。"
         ),
+        "annotations": {
+            "title": "查看五子棋事件",
+            "readOnlyHint": True,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": False
+        },
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -4371,36 +4470,10 @@ TOOLS = [
                 },
                 "since_event_id": {
                     "type": "integer",
-                    "description": (
-                        "只返回这个事件编号之后的新事件。"
-                    ),
+                    "description": "只返回这个事件编号之后的新事件。",
                     "default": 0
                 }
             }
-        }
-    },
-    {
-        "name": "game_say",
-        "description": (
-            "把 Sei 在游戏中想说的一句话写进棋局，"
-            "供五子棋 HTML 界面显示。"
-            "适合落子前后对用户自然回应。"
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "message": {
-                    "type": "string",
-                    "description": "Sei 要在游戏里说的话"
-                },
-                "game_id": {
-                    "type": "string",
-                    "default": "main"
-                }
-            },
-            "required": [
-                "message"
-            ]
         }
     },
     {
@@ -4409,6 +4482,13 @@ TOOLS = [
             "重新开始一局五子棋。"
             "会清空当前棋盘，用户仍然执黑先手。"
         ),
+        "annotations": {
+            "title": "重新开始五子棋",
+            "readOnlyHint": False,
+            "destructiveHint": True,
+            "idempotentHint": False,
+            "openWorldHint": False
+        },
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -4426,14 +4506,11 @@ FUNCTIONS = {
     "get_game_state":
         get_game_state,
 
-    "play_gomoku_move":
-        play_gomoku_move,
+    "play_gomoku_turn":
+        play_gomoku_turn,
 
     "get_game_events":
         get_game_events,
-
-    "game_say":
-        game_say,
 
     "reset_gomoku":
         reset_gomoku,
@@ -4454,9 +4531,8 @@ def home():
         "health_mcp": "/health/mcp",
         "tools": [
             "get_game_state",
-            "play_gomoku_move",
+            "play_gomoku_turn",
             "get_game_events",
-            "game_say",
             "reset_gomoku"
         ]
     }
