@@ -11,6 +11,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 
 import json
 import os
+import threading
 import uvicorn
 
 from urllib.parse import quote
@@ -3570,252 +3571,894 @@ def get_health_summary() -> dict[str, Any]:
 
 
 # =========================
+# 五子棋游戏桥接层
+# =========================
+#
+# /mcp 只暴露下面的五子棋工具给 Echoes 角色。
+# /health/mcp 继续由原来的 Health MCP 独立提供，不受这里影响。
+#
+# 棋局状态保存在 Railway Volume 的 /data 中，
+# 因此普通重启/重新部署后仍可保留当前棋局。
+#
+
+GAME_DATA_FILE = Path(
+    os.environ.get(
+        "GAME_DATA_FILE",
+        "/data/echoes_gomoku_games.json"
+    )
+)
+
+GAME_LOCK = threading.Lock()
+BOARD_SIZE = 15
+COL_LABELS = "ABCDEFGHIJKLMNO"
+
+
+def _new_game_state():
+
+    return {
+        "board": [
+            [
+                None
+                for _ in range(BOARD_SIZE)
+            ]
+            for _ in range(BOARD_SIZE)
+        ],
+        "turn": "user",
+        "winner": None,
+        "game_over": False,
+        "move_count": 0,
+        "last_move": None,
+        "events": [],
+        "next_event_id": 1,
+        "last_message": None
+    }
+
+
+def _load_game_db():
+
+    if not GAME_DATA_FILE.exists():
+        return {}
+
+    try:
+        with GAME_DATA_FILE.open(
+            "r",
+            encoding="utf-8"
+        ) as fp:
+            data = json.load(fp)
+
+        if isinstance(data, dict):
+            return data
+
+    except Exception:
+        pass
+
+    return {}
+
+
+def _save_game_db(db):
+
+    GAME_DATA_FILE.parent.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    with GAME_DATA_FILE.open(
+        "w",
+        encoding="utf-8"
+    ) as fp:
+        json.dump(
+            db,
+            fp,
+            ensure_ascii=False,
+            indent=2
+        )
+
+
+def _add_game_event(
+    state,
+    event_type,
+    actor,
+    data
+):
+
+    event = {
+        "id": state.get(
+            "next_event_id",
+            1
+        ),
+        "type": event_type,
+        "actor": actor,
+        "data": data,
+        "time": datetime.now(
+            timezone.utc
+        ).isoformat()
+    }
+
+    state.setdefault(
+        "events",
+        []
+    ).append(event)
+
+    state["next_event_id"] = (
+        event["id"] + 1
+    )
+
+    return event
+
+
+def _ensure_game(
+    db,
+    game_id
+):
+
+    state = db.get(game_id)
+
+    if not isinstance(
+        state,
+        dict
+    ):
+        state = _new_game_state()
+        db[game_id] = state
+
+        _add_game_event(
+            state,
+            "game_started",
+            "system",
+            {
+                "message": "五子棋开始",
+                "first_turn": "user"
+            }
+        )
+
+    return state
+
+
+def _coordinate_label(
+    row,
+    col
+):
+
+    return (
+        f"{COL_LABELS[col]}"
+        f"{row + 1}"
+    )
+
+
+def _check_gomoku_win(
+    board,
+    row,
+    col,
+    player
+):
+
+    directions = [
+        (1, 0),
+        (0, 1),
+        (1, 1),
+        (1, -1)
+    ]
+
+    for dr, dc in directions:
+        count = 1
+
+        r = row + dr
+        c = col + dc
+
+        while (
+            0 <= r < BOARD_SIZE
+            and 0 <= c < BOARD_SIZE
+            and board[r][c] == player
+        ):
+            count += 1
+            r += dr
+            c += dc
+
+        r = row - dr
+        c = col - dc
+
+        while (
+            0 <= r < BOARD_SIZE
+            and 0 <= c < BOARD_SIZE
+            and board[r][c] == player
+        ):
+            count += 1
+            r -= dr
+            c -= dc
+
+        if count >= 5:
+            return True
+
+    return False
+
+
+def _public_game_state(
+    game_id,
+    state
+):
+
+    stones = []
+
+    board = state.get(
+        "board",
+        []
+    )
+
+    for row in range(
+        min(
+            len(board),
+            BOARD_SIZE
+        )
+    ):
+        row_items = board[row]
+
+        if not isinstance(
+            row_items,
+            list
+        ):
+            continue
+
+        for col in range(
+            min(
+                len(row_items),
+                BOARD_SIZE
+            )
+        ):
+            player = row_items[col]
+
+            if player in {
+                "user",
+                "sei"
+            }:
+                stones.append(
+                    {
+                        "player": player,
+                        "row": row,
+                        "col": col,
+                        "coordinate":
+                            _coordinate_label(
+                                row,
+                                col
+                            )
+                    }
+                )
+
+    return {
+        "game_id": game_id,
+        "game": "gomoku",
+        "board_size": BOARD_SIZE,
+        "user_color": "black",
+        "sei_color": "white",
+        "turn": state.get("turn"),
+        "winner": state.get("winner"),
+        "game_over": bool(
+            state.get("game_over")
+        ),
+        "move_count": state.get(
+            "move_count",
+            0
+        ),
+        "last_move": state.get(
+            "last_move"
+        ),
+        "last_message": state.get(
+            "last_message"
+        ),
+        "stones": stones
+    }
+
+
+def _make_gomoku_move(
+    game_id,
+    row,
+    col,
+    player
+):
+
+    try:
+        row = int(row)
+        col = int(col)
+    except Exception:
+        raise ValueError(
+            "row 和 col 必须是整数。"
+        )
+
+    if player not in {
+        "user",
+        "sei"
+    }:
+        raise ValueError(
+            "未知玩家。"
+        )
+
+    if not (
+        0 <= row < BOARD_SIZE
+        and
+        0 <= col < BOARD_SIZE
+    ):
+        raise ValueError(
+            "row 和 col 必须在 0 到 14 之间。"
+        )
+
+    with GAME_LOCK:
+        db = _load_game_db()
+        state = _ensure_game(
+            db,
+            game_id
+        )
+
+        if state.get(
+            "game_over"
+        ):
+            raise ValueError(
+                "这一局已经结束。"
+            )
+
+        if state.get(
+            "turn"
+        ) != player:
+            raise ValueError(
+                "现在轮到 "
+                f"{state.get('turn')}，"
+                f"不是 {player}。"
+            )
+
+        board = state.get(
+            "board"
+        )
+
+        if not isinstance(
+            board,
+            list
+        ):
+            raise ValueError(
+                "棋盘数据损坏，请重新开始。"
+            )
+
+        if board[row][col] is not None:
+            raise ValueError(
+                f"{_coordinate_label(row, col)} "
+                "已经有棋子。"
+            )
+
+        board[row][col] = player
+        state["move_count"] = (
+            int(
+                state.get(
+                    "move_count",
+                    0
+                )
+            )
+            + 1
+        )
+
+        move = {
+            "player": player,
+            "row": row,
+            "col": col,
+            "coordinate":
+                _coordinate_label(
+                    row,
+                    col
+                ),
+            "move_number":
+                state["move_count"]
+        }
+
+        state["last_move"] = move
+
+        _add_game_event(
+            state,
+            "move",
+            player,
+            move
+        )
+
+        if _check_gomoku_win(
+            board,
+            row,
+            col,
+            player
+        ):
+            state["winner"] = player
+            state["game_over"] = True
+            state["turn"] = None
+
+            _add_game_event(
+                state,
+                "game_over",
+                "system",
+                {
+                    "winner": player,
+                    "reason":
+                        "five_in_a_row"
+                }
+            )
+
+        elif (
+            state["move_count"]
+            >= BOARD_SIZE * BOARD_SIZE
+        ):
+            state["winner"] = "draw"
+            state["game_over"] = True
+            state["turn"] = None
+
+            _add_game_event(
+                state,
+                "game_over",
+                "system",
+                {
+                    "winner": "draw",
+                    "reason": "board_full"
+                }
+            )
+
+        else:
+            state["turn"] = (
+                "sei"
+                if player == "user"
+                else "user"
+            )
+
+        db[game_id] = state
+        _save_game_db(db)
+
+        return {
+            "ok": True,
+            "move": move,
+            "state": _public_game_state(
+                game_id,
+                state
+            )
+        }
+
+
+def get_game_state(
+    game_id: str = "main"
+):
+    """
+    查看当前五子棋棋局。
+    用户执黑先手，Sei 执白。
+    """
+
+    game_id = str(
+        game_id
+        or "main"
+    ).strip() or "main"
+
+    with GAME_LOCK:
+        db = _load_game_db()
+        existed = game_id in db
+        state = _ensure_game(
+            db,
+            game_id
+        )
+
+        if not existed:
+            _save_game_db(db)
+
+        return _public_game_state(
+            game_id,
+            state
+        )
+
+
+def play_gomoku_move(
+    row: int,
+    col: int,
+    game_id: str = "main"
+):
+    """
+    让 Sei 在当前棋局中亲自下一颗白棋。
+    只有 turn=sei 时才能成功。
+    """
+
+    game_id = str(
+        game_id
+        or "main"
+    ).strip() or "main"
+
+    try:
+        return _make_gomoku_move(
+            game_id,
+            row,
+            col,
+            "sei"
+        )
+
+    except ValueError as error:
+        return {
+            "ok": False,
+            "error": str(error),
+            "state": get_game_state(
+                game_id
+            )
+        }
+
+
+def get_game_events(
+    game_id: str = "main",
+    since_event_id: int = 0
+):
+    """
+    查看棋局事件；可只读取某个事件编号之后的新变化。
+    """
+
+    game_id = str(
+        game_id
+        or "main"
+    ).strip() or "main"
+
+    try:
+        since_event_id = int(
+            since_event_id
+        )
+    except Exception:
+        since_event_id = 0
+
+    with GAME_LOCK:
+        db = _load_game_db()
+        existed = game_id in db
+        state = _ensure_game(
+            db,
+            game_id
+        )
+
+        if not existed:
+            _save_game_db(db)
+
+        events = [
+            event
+            for event in state.get(
+                "events",
+                []
+            )
+            if int(
+                event.get(
+                    "id",
+                    0
+                )
+            ) > since_event_id
+        ]
+
+        return {
+            "game_id": game_id,
+            "events": events,
+            "latest_event_id": (
+                int(
+                    state.get(
+                        "next_event_id",
+                        1
+                    )
+                )
+                - 1
+            )
+        }
+
+
+def game_say(
+    message: str,
+    game_id: str = "main"
+):
+    """
+    让 Sei 把一句游戏中的话写进棋局，供 HTML 显示。
+    """
+
+    game_id = str(
+        game_id
+        or "main"
+    ).strip() or "main"
+
+    message = str(
+        message
+        or ""
+    ).strip()
+
+    if not message:
+        return {
+            "ok": False,
+            "error": "message 不能为空。"
+        }
+
+    if len(message) > 500:
+        message = message[:500]
+
+    with GAME_LOCK:
+        db = _load_game_db()
+        state = _ensure_game(
+            db,
+            game_id
+        )
+
+        item = {
+            "actor": "sei",
+            "message": message,
+            "time": datetime.now(
+                timezone.utc
+            ).isoformat()
+        }
+
+        state["last_message"] = item
+
+        event = _add_game_event(
+            state,
+            "message",
+            "sei",
+            {
+                "message": message
+            }
+        )
+
+        db[game_id] = state
+        _save_game_db(db)
+
+        return {
+            "ok": True,
+            "message": item,
+            "event_id": event["id"]
+        }
+
+
+def reset_gomoku(
+    game_id: str = "main"
+):
+    """
+    重新开始一局五子棋；用户继续执黑先手。
+    """
+
+    game_id = str(
+        game_id
+        or "main"
+    ).strip() or "main"
+
+    with GAME_LOCK:
+        db = _load_game_db()
+        state = _new_game_state()
+
+        _add_game_event(
+            state,
+            "game_started",
+            "system",
+            {
+                "message":
+                    "五子棋重新开始",
+                "first_turn": "user"
+            }
+        )
+
+        db[game_id] = state
+        _save_game_db(db)
+
+        return {
+            "ok": True,
+            "state": _public_game_state(
+                game_id,
+                state
+            )
+        }
+
+
+# =========================
+# 五子棋普通 HTTP 接口
+# HTML 通过这些接口同步棋盘
+# =========================
+
+@app.get(
+    "/game/gomoku/{game_id}"
+)
+def gomoku_http_state(
+    game_id: str
+):
+
+    return get_game_state(
+        game_id
+    )
+
+
+@app.post(
+    "/game/gomoku/{game_id}/user-move"
+)
+async def gomoku_http_user_move(
+    game_id: str,
+    request: Request
+):
+
+    try:
+        body = await request.json()
+
+        result = _make_gomoku_move(
+            game_id,
+            body.get("row"),
+            body.get("col"),
+            "user"
+        )
+
+        return result
+
+    except ValueError as error:
+        raise HTTPException(
+            status_code=400,
+            detail=str(error)
+        )
+
+
+@app.post(
+    "/game/gomoku/{game_id}/reset"
+)
+def gomoku_http_reset(
+    game_id: str
+):
+
+    return reset_gomoku(
+        game_id
+    )
+
+
+# =========================
 # MCP 工具定义
 # =========================
 
 TOOLS = [
-
     {
-        "name":
-            "check_on_wife",
-
-        "description":
-            "查询手机最近打开的 App "
-            "和已经计算好的使用时长",
-
+        "name": "get_game_state",
+        "description": (
+            "查看当前五子棋棋局。"
+            "用户执黑先手，Sei 执白。"
+            "返回当前轮到谁、最后一步、胜负和全部棋子坐标。"
+            "当用户询问棋盘、轮到谁、谁赢了，"
+            "或 Sei 准备落子前，应先调用此工具。"
+        ),
         "inputSchema": {
-
-            "type":
-                "object",
-
+            "type": "object",
             "properties": {
-
-                "limit": {
-                    "type":
-                        "integer",
-
-                    "description":
-                        "最多返回多少条"
-                        "最近 App 记录",
-
-                    "default":
-                        10
+                "game_id": {
+                    "type": "string",
+                    "description": (
+                        "棋局编号。默认 main。"
+                    ),
+                    "default": "main"
                 }
-
             }
-
         }
-
     },
-
     {
-        "name":
-            "bark_alert",
-
-        "description":
-            "通过 Bark 给手机发送通知",
-
+        "name": "play_gomoku_move",
+        "description": (
+            "让 Sei 在五子棋中亲自下一颗白棋。"
+            "必须先查看棋局并确认 turn=sei。"
+            "row 和 col 都从 0 开始，范围 0~14。"
+            "例如 H8 对应 row=7、col=7。"
+        ),
         "inputSchema": {
-
-            "type":
-                "object",
-
+            "type": "object",
             "properties": {
-
-                "title": {
-                    "type":
-                        "string",
-
-                    "description":
-                        "通知标题",
-
-                    "default":
-                        "Robin"
+                "row": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 14,
+                    "description": "行号，0~14"
                 },
-
-                "content": {
-                    "type":
-                        "string",
-
-                    "description":
-                        "通知正文"
+                "col": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 14,
+                    "description": "列号，0~14"
+                },
+                "game_id": {
+                    "type": "string",
+                    "description": "棋局编号，默认 main",
+                    "default": "main"
                 }
-
             },
-
             "required": [
-                "content"
+                "row",
+                "col"
             ]
-
         }
-
     },
-
     {
-        "name":
-            "curfew_pause",
-
-        "description":
-            "当用户在收到宵禁提醒后表示"
-            "还想再玩一会儿、晚一点睡，"
-            "自动读取刚才尚未处理的系统提醒，"
-            "让 Robin 知道刚才提醒了什么，"
-            "然后暂停宵禁 Bark 提醒指定分钟。"
-            "例如用户说再玩10分钟时，"
-            "应使用 minutes=10。",
-
+        "name": "get_game_events",
+        "description": (
+            "查看五子棋最近发生的事件。"
+            "用于知道用户刚刚下在哪里、游戏是否结束、"
+            "以及自上次查看后发生了哪些变化。"
+        ),
         "inputSchema": {
-
-            "type":
-                "object",
-
+            "type": "object",
             "properties": {
-
-                "minutes": {
-                    "type":
-                        "integer",
-
-                    "description":
-                        "暂停多少分钟，"
-                        "根据用户明确说的时间填写。"
-                        "例如再玩10分钟就填10，"
-                        "半小时就填30，"
-                        "一小时就填60。",
-
-                    "default":
-                        60
+                "game_id": {
+                    "type": "string",
+                    "default": "main"
+                },
+                "since_event_id": {
+                    "type": "integer",
+                    "description": (
+                        "只返回这个事件编号之后的新事件。"
+                    ),
+                    "default": 0
                 }
-
             }
-
         }
-
     },
-
     {
-        "name":
-            "curfew_allow_tonight",
-
-        "description":
-            "当用户在收到宵禁提醒后明确表示"
-            "今晚要熬夜、今晚不想睡、"
-            "今晚不要再提醒时使用。"
-            "工具会自动读取刚才尚未处理的"
-            "系统提醒，让 Robin 知道提醒内容，"
-            "然后暂停今晚剩余的 Bark 宵禁提醒，"
-            "早上06:00自动恢复。",
-
+        "name": "game_say",
+        "description": (
+            "把 Sei 在游戏中想说的一句话写进棋局，"
+            "供五子棋 HTML 界面显示。"
+            "适合落子前后对用户自然回应。"
+        ),
         "inputSchema": {
-
-            "type":
-                "object",
-
-            "properties": {}
-
+            "type": "object",
+            "properties": {
+                "message": {
+                    "type": "string",
+                    "description": "Sei 要在游戏里说的话"
+                },
+                "game_id": {
+                    "type": "string",
+                    "default": "main"
+                }
+            },
+            "required": [
+                "message"
+            ]
         }
-
     },
-
     {
-        "name":
-            "curfew_resume",
-
-        "description":
-            "立即取消宵禁暂停状态，"
-            "恢复正常的夜间提醒。"
-            "例如用户之前说今晚不提醒，"
-            "后来又要求恢复提醒时使用。",
-
+        "name": "reset_gomoku",
+        "description": (
+            "重新开始一局五子棋。"
+            "会清空当前棋盘，用户仍然执黑先手。"
+        ),
         "inputSchema": {
-
-            "type":
-                "object",
-
-            "properties": {}
-
+            "type": "object",
+            "properties": {
+                "game_id": {
+                    "type": "string",
+                    "default": "main"
+                }
+            }
         }
-
-    },
-
-    {
-        "name":
-            "get_pending_reminders",
-
-        "description":
-            "手动读取 Railway 后台尚未在聊天中"
-            "处理过的系统提醒。"
-            "如果用户只是询问有没有未读提醒，"
-            "可以调用此工具。"
-            "curfew_pause 和 "
-            "curfew_allow_tonight "
-            "已经会自动读取未读宵禁提醒，"
-            "无需额外再调用一次。"
-            "读取后提醒会标记为已读。",
-
-        "inputSchema": {
-
-            "type":
-                "object",
-
-            "properties": {}
-
-        }
-
     }
-
 ]
 
 
 FUNCTIONS = {
+    "get_game_state":
+        get_game_state,
 
-    "check_on_wife":
-        check_on_wife,
+    "play_gomoku_move":
+        play_gomoku_move,
 
-    "bark_alert":
-        bark_alert,
+    "get_game_events":
+        get_game_events,
 
-    "curfew_pause":
-        curfew_pause,
+    "game_say":
+        game_say,
 
-    "curfew_allow_tonight":
-        curfew_allow_tonight,
-
-    "curfew_resume":
-        curfew_resume,
-
-    "get_pending_reminders":
-        get_pending_reminders,
-
+    "reset_gomoku":
+        reset_gomoku,
 }
 
 
 # =========================
 # Railway 状态接口
 # =========================
-
 @app.get("/")
 def home():
 
     return {
-
-        "status":
-            "online",
-
-        "server":
-            "echoes-mcp",
-
-        "health_mcp":
-            "/health/mcp",
-
+        "status": "online",
+        "server": "echoes-game-mcp",
+        "game": "gomoku",
+        "game_api": "/game/gomoku/main",
+        "health_mcp": "/health/mcp",
         "tools": [
-            "check_on_wife",
-            "bark_alert",
-            "curfew_pause",
-            "curfew_allow_tonight",
-            "curfew_resume",
-            "get_pending_reminders"
+            "get_game_state",
+            "play_gomoku_move",
+            "get_game_events",
+            "game_say",
+            "reset_gomoku"
         ]
-
     }
 
 
@@ -3865,10 +4508,10 @@ async def mcp(
 
                 "serverInfo": {
                     "name":
-                        "echoes-mcp",
+                        "echoes-game-mcp",
 
                     "version":
-                        "1.3"
+                        "2.0"
                 }
 
             }
@@ -3991,10 +4634,17 @@ async def mcp(
                         "type":
                             "text",
 
-                        "text":
-                            str(
-                                result
+                        "text": (
+                            json.dumps(
+                                result,
+                                ensure_ascii=False
                             )
+                            if isinstance(
+                                result,
+                                (dict, list)
+                            )
+                            else str(result)
+                        )
                     }
 
                 ]
