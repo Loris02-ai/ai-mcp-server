@@ -1,6 +1,6 @@
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 
 import asyncio
 import contextlib
@@ -15,6 +15,7 @@ import json
 import os
 import threading
 import uvicorn
+import httpx
 
 from urllib.parse import quote
 from urllib.request import Request as URLRequest
@@ -5058,6 +5059,109 @@ async def siliconflow_proxy(
                 "utf-8"
             )
 
+    wants_stream = (
+        isinstance(payload, dict)
+        and payload.get("stream") is True
+    ) if is_chat_completions else False
+
+    # Echoes 的工具调用会使用 OpenAI 风格 SSE 流。
+    # 必须逐块透传，不能等 SiliconFlow 整个响应结束后再一次性返回，
+    # 否则 Echoes 会一直停在“正在处理外部任务”。
+    if wants_stream:
+
+        forward_headers = {}
+
+        for header_name in (
+            "Authorization",
+            "Content-Type",
+            "Accept",
+            "User-Agent",
+        ):
+
+            value = request.headers.get(
+                header_name
+            )
+
+            if value:
+                forward_headers[
+                    header_name
+                ] = value
+
+        client = httpx.AsyncClient(
+            timeout=httpx.Timeout(
+                connect=30.0,
+                read=180.0,
+                write=30.0,
+                pool=30.0,
+            )
+        )
+
+        try:
+            upstream_request = client.build_request(
+                method,
+                upstream_url,
+                headers=forward_headers,
+                content=body_bytes,
+            )
+
+            upstream_response = await client.send(
+                upstream_request,
+                stream=True,
+            )
+
+        except Exception as exc:
+            await client.aclose()
+
+            return Response(
+                content=json.dumps(
+                    {
+                        "error": {
+                            "message": (
+                                "SiliconFlow upstream unavailable: "
+                                f"{exc}"
+                            )
+                        }
+                    },
+                    ensure_ascii=False
+                ),
+                status_code=502,
+                media_type="application/json",
+            )
+
+        content_type = upstream_response.headers.get(
+            "Content-Type",
+            "text/event-stream"
+        )
+
+        async def stream_body():
+
+            try:
+                async for chunk in upstream_response.aiter_bytes():
+                    if chunk:
+                        yield chunk
+
+            finally:
+                await upstream_response.aclose()
+                await client.aclose()
+
+        return StreamingResponse(
+            stream_body(),
+            status_code=upstream_response.status_code,
+            media_type=content_type.split(
+                ";",
+                1
+            )[0].strip(),
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+                "X-Echoes-GLM-Thinking-Budget": (
+                    str(applied_budget)
+                    if applied_budget is not None
+                    else "unchanged"
+                ),
+            },
+        )
+
     try:
 
         (
@@ -5131,9 +5235,8 @@ async def siliconflow_proxy(
         )
     }
 
-    # 对 SSE / JSON 都保留上游 Content-Type。
-    # 若 Echoes 发送 stream=true，本实现会先收完整上游响应再返回；
-    # 用户当前的“流式兼容模式”保持关闭即可。
+    # 非流式响应保留上游 Content-Type。
+    # stream=true 已在上方通过 StreamingResponse 实时透传。
     return Response(
         content=response_body,
         status_code=status_code,
