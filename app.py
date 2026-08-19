@@ -4461,6 +4461,30 @@ def gomoku_http_reset(
 
 TOOLS = [
     {
+        "name": "check_on_wife",
+        "description": (
+            "查询最近的 App 使用活动和使用时长。"
+            "当用户询问最近打开了哪些 App、各 App 使用多久时调用。"
+        ),
+        "annotations": {
+            "title": "查询手机活动",
+            "readOnlyHint": True,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": True
+        },
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "limit": {
+                    "type": "integer",
+                    "description": "最多显示多少条最近 App 记录。",
+                    "default": 10
+                }
+            }
+        }
+    },
+    {
         "name": "get_game_state",
         "description": (
             "读取当前15×15五子棋。B=用户黑棋，W=Sei白棋。"
@@ -4587,6 +4611,9 @@ TOOLS = [
 
 
 FUNCTIONS = {
+    "check_on_wife":
+        check_on_wife,
+
     "get_game_state":
         get_game_state_mcp,
 
@@ -4614,6 +4641,7 @@ def home():
         "game_api": "/game/gomoku/main",
         "health_mcp": "/health/mcp",
         "tools": [
+            "check_on_wife",
             "get_game_state",
             "play_gomoku_turn",
             "get_game_events",
